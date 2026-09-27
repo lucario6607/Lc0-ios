@@ -66,6 +66,8 @@ jobs:
           # Logs need a sign-in on GitHub; annotations don't, so surface errors there.
           grep -E "error:|Undefined symbols|referenced from|ld: " "$RUNNER_TEMP/xcodebuild.log" \
             | sort -u | head -40 | while IFS= read -r line; do echo "::error::${line:0:900}"; done
+          grep -A2 "duplicate symbol" "$RUNNER_TEMP/xcodebuild.log" | head -24 \
+            | tr '\n' ' ' | sed 's/--/\n/g' | while IFS= read -r line; do echo "::error::${line:0:900}"; done
           tail -5 "$RUNNER_TEMP/xcodebuild.log"
           exit $status
 
@@ -74,7 +76,7 @@ jobs:
           set +e
           APP="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app"
           BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP/Info.plist")"
-          echo "::notice::app binary $(stat -f%z "$BIN") bytes; liblc0_all.a $(stat -f%z app/Vendor/lib/liblc0_all.a) bytes; $(wc -l < build/archives.txt) archives merged; $(grep LC0_ONNX app/Vendor/lc0.xcconfig)"
+          echo "::notice::app binary $(stat -f%z "$BIN") bytes; liblc0.a $(stat -f%z app/Vendor/lib/liblc0.a) bytes; $(grep LC0_ONNX app/Vendor/lc0.xcconfig)"
           strings -a "$BIN" > "$RUNNER_TEMP/strings.txt"
           missing=""
           for backend in metal blas eigen onnx-coreml; do

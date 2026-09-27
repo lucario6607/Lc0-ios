@@ -128,16 +128,27 @@ grep -E "Accelerate|appleframeworks|onnxruntime|Run-time dependency" \
   "$WORK/meson/meson-logs/meson-log.txt" | grep -iE "found" | sort -u || true
 
 # --- bundle -----------------------------------------------------------------
-# lc0 is a static library, but its dependencies (abseil, maybe zlib) are
-# separate archives. Merge everything into one so Xcode needs a single -l.
+# liblc0.a is lc0 itself; its dependencies (abseil, maybe zlib) are separate
+# archives, merged into liblc0_deps.a.
+#
+# liblc0.a gets -force_load: backends and search algorithms register themselves
+# from static initializers that nothing references, so a plain -l would drop
+# them. The deps are linked normally, so only what's needed is pulled in and
+# they can't clash with the copies bundled inside ONNX Runtime.
 find "$WORK/meson" -name '*.a' -print > "$WORK/archives.txt"
-cat "$WORK/archives.txt"
-xcrun libtool -static -no_warning_for_no_symbols -o "$VENDOR/lib/liblc0_all.a" \
-  $(cat "$WORK/archives.txt")
+echo "::notice::archives: $(sed "s#$WORK/meson/##" "$WORK/archives.txt" | tr '\n' ' ')"
+cp "$WORK/meson/liblc0.a" "$VENDOR/lib/liblc0.a"
+grep -v "^$WORK/meson/liblc0.a\$" "$WORK/archives.txt" > "$WORK/deps.txt"
+rm -f "$VENDOR/lib/liblc0_deps.a" "$VENDOR/lib/liblc0_all.a"
+if [ -s "$WORK/deps.txt" ]; then
+  xcrun libtool -static -no_warning_for_no_symbols -o "$VENDOR/lib/liblc0_deps.a" \
+    $(cat "$WORK/deps.txt")
+  DEPS_FLAG="-llc0_deps"
+else
+  DEPS_FLAG=""
+fi
 
-# -force_load: backends and search algorithms register themselves from static
-# initializers that nothing references, so a plain -l would drop them all.
-LDFLAGS="-Wl,-force_load,\$(PROJECT_DIR)/Vendor/lib/liblc0_all.a -lz -lc++ -framework Foundation -framework Metal"
+LDFLAGS="-Wl,-force_load,\$(PROJECT_DIR)/Vendor/lib/liblc0.a $DEPS_FLAG -lz -lc++ -framework Foundation -framework Metal"
 LDFLAGS="$LDFLAGS -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph"
 LDFLAGS="$LDFLAGS -framework Accelerate"
 if [ "$ONNX_BUILT" = true ]; then
@@ -155,5 +166,5 @@ LC0_VERSION_INFO = $LC0_REF ($LC0_REV)
 LC0_ONNX = $ONNX_BUILT
 EOF
 
-echo "::notice::Built lc0 $LC0_REF ($LC0_REV), onnx=$ONNX_BUILT, liblc0_all.a $(stat -f%z "$VENDOR/lib/liblc0_all.a") bytes from $(wc -l < "$WORK/archives.txt") archives"
+echo "::notice::Built lc0 $LC0_REF ($LC0_REV), onnx=$ONNX_BUILT, liblc0.a $(stat -f%z "$VENDOR/lib/liblc0.a") bytes, $(wc -l < "$WORK/deps.txt") dependency archives"
 ls -lh "$VENDOR/lib"
