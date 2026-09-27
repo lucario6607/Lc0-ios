@@ -1,0 +1,127 @@
+name: Convert net to Core ML
+
+# Converts an lc0 network to a Core ML model for LeelaBench's coreml backend,
+# checks it against ONNX Runtime, and publishes it as a release asset the app
+# can download by URL.
+on:
+  # Also runs when convert/request.txt changes, so a conversion can be started
+  # with a commit.
+  push:
+    branches: [main]
+    paths: [convert/request.txt, tools/**, .github/workflows/convert-net.yml]
+  workflow_dispatch:
+    inputs:
+      net_url:
+        description: URL of the lc0 network (.pb.gz)
+        required: true
+      batch_sizes:
+        description: Batch sizes to include (one Core ML function each)
+        default: "1,8,16,32,64,128,256"
+      precision:
+        description: Compute precision
+        type: choice
+        options: [fp16, fp32]
+        default: fp16
+
+permissions:
+  contents: write  # publish the converted model as a release
+
+jobs:
+  convert:
+    runs-on: macos-15
+    timeout-minutes: 150
+    env:
+      LC0_REF: release/0.33
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          pip3 install --break-system-packages meson ninja coremltools onnx onnxruntime numpy
+          python3 -c "import coremltools; print('coremltools', coremltools.__version__)"
+
+      - name: Cache lc0 (macOS, converter only)
+        id: lc0cache
+        uses: actions/cache@v4
+        with:
+          path: build/lc0-mac/lc0
+          key: lc0-mac-${{ env.LC0_REF }}-v1
+
+      - name: Build lc0 for macOS
+        if: steps.lc0cache.outputs.cache-hit != 'true'
+        run: |
+          git clone -q --depth 1 -b "$LC0_REF" https://github.com/LeelaChessZero/lc0.git build/lc0-src
+          meson setup build/lc0-mac build/lc0-src --buildtype=release \
+            -Dbuild_backends=false -Dgtest=false
+          ninja -C build/lc0-mac lc0
+
+      - name: Read request
+        id: req
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            url='${{ inputs.net_url }}'; sizes='${{ inputs.batch_sizes }}'; prec='${{ inputs.precision }}'
+          else
+            url="$(sed -n 's/^url=//p' convert/request.txt)"
+            sizes="$(sed -n 's/^batch_sizes=//p' convert/request.txt)"
+            prec="$(sed -n 's/^precision=//p' convert/request.txt)"
+          fi
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "sizes=${sizes:-1,8,16,32,64,128,256}" >> "$GITHUB_OUTPUT"
+          echo "precision=${prec:-fp16}" >> "$GITHUB_OUTPUT"
+
+      - name: Download network
+        id: net
+        env:
+          NET_URL: ${{ steps.req.outputs.url }}
+        run: |
+          mkdir -p work
+          curl -fsSL -o work/net.pb.gz "$NET_URL"
+          name="$(basename "${NET_URL%%\?*}")"
+          name="${name%.gz}"; name="${name%.pb}"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          ls -lh work/net.pb.gz
+
+      - name: Export to ONNX
+        run: build/lc0-mac/lc0 leela2onnx --input=work/net.pb.gz --output=work/net.onnx --onnx-data-type=f32
+
+      - name: Convert to Core ML
+        run: |
+          python3 tools/lc0_to_coreml.py --onnx work/net.onnx --net work/net.pb.gz \
+            --out work/out --name "${{ steps.net.outputs.name }}" \
+            --batch-sizes "${{ steps.req.outputs.sizes }}" --precision "${{ steps.req.outputs.precision }}"
+          du -sh work/out/*
+
+      - name: Check against ONNX Runtime
+        run: |
+          smallest="$(echo '${{ steps.req.outputs.sizes }}' | tr ',' '\n' | sort -n | head -1)"
+          python3 tools/verify_coreml.py --onnx work/net.onnx \
+            --package "work/out/${{ steps.net.outputs.name }}.mlpackage" \
+            --meta work/out/lc0coreml.json --batch-sizes "$smallest,64"
+
+      - name: Compile and package
+        id: pkg
+        run: |
+          name="${{ steps.net.outputs.name }}"
+          mkdir -p work/compiled "work/pkg/$name.lc0coreml"
+          xcrun coremlcompiler compile "work/out/$name.mlpackage" work/compiled \
+            --platform iOS --deployment-target 18.0 \
+            || xcrun coremlcompiler compile "work/out/$name.mlpackage" work/compiled
+          cp -R "work/compiled/$name.mlmodelc" "work/pkg/$name.lc0coreml/model.mlmodelc"
+          cp work/out/lc0coreml.json "work/pkg/$name.lc0coreml/"
+          asset="$name-${{ steps.req.outputs.precision }}.lc0coreml.aar"
+          aa archive -d work/pkg -o "work/$asset"
+          ls -lh "work/$asset"
+          echo "asset=work/$asset" >> "$GITHUB_OUTPUT"
+          echo "tag=coreml-$name-${{ steps.req.outputs.precision }}" >> "$GITHUB_OUTPUT"
+          echo "::notice title=Converted::$asset ($(du -h "work/$asset" | cut -f1))"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.pkg.outputs.tag }}
+          name: "Core ML: ${{ steps.net.outputs.name }} (${{ steps.req.outputs.precision }})"
+          body: |
+            Converted from ${{ steps.req.outputs.url }}
+            Batch sizes: ${{ steps.req.outputs.sizes }}
+            In LeelaBench: Networks → Download from URL → paste this asset's link.
+          files: ${{ steps.pkg.outputs.asset }}

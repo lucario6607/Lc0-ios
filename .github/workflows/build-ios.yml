@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    paths-ignore: [tools/**, convert/**, .github/workflows/convert-net.yml]
   pull_request:
   workflow_dispatch:
     inputs:

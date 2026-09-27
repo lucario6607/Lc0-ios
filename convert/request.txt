@@ -1,0 +1,3 @@
+url=https://storage.lczero.org/files/networks-contrib/t3-512x15x16h-distill-swa-2767500.pb.gz
+batch_sizes=1,16,64,256
+precision=fp16
