@@ -44,11 +44,38 @@ final class OutputCapture {
 final class LogBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var text = ""
+    private var file: FileHandle?
 
     func append(_ chunk: String) {
         lock.lock()
         text += chunk
         lock.unlock()
+        writeToFile(chunk)
+    }
+
+    /// Mirror output to `url` as it arrives, so it survives the app being killed.
+    func startFile(at url: URL, header: String) {
+        FileManager.default.createFile(atPath: url.path, contents: Data(header.utf8))
+        let handle = try? FileHandle(forWritingTo: url)
+        _ = try? handle?.seekToEnd()
+        lock.lock()
+        file = handle
+        lock.unlock()
+    }
+
+    func closeFile() {
+        lock.lock()
+        try? file?.close()
+        file = nil
+        lock.unlock()
+    }
+
+    func writeToFile(_ chunk: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let file else { return }
+        try? file.write(contentsOf: Data(chunk.utf8))
+        try? file.synchronize()
     }
 
     func drain() -> String {
@@ -63,18 +90,35 @@ final class LogBuffer: @unchecked Sendable {
 final class EngineRunner: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var log = ""
+    /// Output of a run that never finished — the app was killed mid-run.
+    @Published var crashedRunLog: String?
+    @Published private(set) var lowestAvailableMemory: Int?
 
     nonisolated static let exitMarker = "\u{1}LC0_EXIT "
     private static let maxLogLength = 400_000
+    private static let runLogURL = FileLocations.documents.appendingPathComponent("last-run.log")
+    private static let runInProgressKey = "runInProgress"
 
     private let buffer = LogBuffer()
     private var flushTimer: Timer?
+    private var memoryTimer: Timer?
+    private var memoryWarning: NSObjectProtocol?
     private var runLog = ""
     private var completion: ((String, Int32) -> Void)?
 
     init() {
         let buffer = self.buffer
         OutputCapture.shared.setHandler { text in buffer.append(text) }
+
+        if UserDefaults.standard.bool(forKey: Self.runInProgressKey) {
+            UserDefaults.standard.set(false, forKey: Self.runInProgressKey)
+            let text = (try? String(contentsOf: Self.runLogURL, encoding: .utf8)) ?? "(no log was saved)"
+            crashedRunLog = String(text.suffix(100_000))
+        }
+    }
+
+    nonisolated private static func availableMemoryMB() -> String {
+        "\(os_proc_available_memory() / 1_048_576) MB"
     }
 
     /// Runs `lc0 <args...>`. `completion` gets the full output of this run and
@@ -87,8 +131,32 @@ final class EngineRunner: ObservableObject {
         self.completion = completion
         UIApplication.shared.isIdleTimerDisabled = true
 
+        buffer.startFile(at: Self.runLogURL, header: """
+            LeelaBench run \(Date().formatted(.iso8601))
+            device: \(DeviceInfo.summary), RAM \(DeviceInfo.physicalMemory), thermal \(DeviceInfo.thermalState)
+            available memory at start: \(Self.availableMemoryMB())
+            \(log)
+            """)
+        UserDefaults.standard.set(true, forKey: Self.runInProgressKey)
+        lowestAvailableMemory = os_proc_available_memory()
+
         flushTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.flush() }
+        }
+        // Memory trail in the saved log only: if iOS kills the app for memory,
+        // the last lines show how close it got.
+        memoryTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                let available = os_proc_available_memory()
+                self.lowestAvailableMemory = min(self.lowestAvailableMemory ?? available, available)
+                self.buffer.writeToFile("[LeelaBench] available memory: \(available / 1_048_576) MB\n")
+            }
+        }
+        memoryWarning = NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification, object: nil, queue: .main
+        ) { [buffer] _ in
+            buffer.writeToFile("[LeelaBench] iOS memory warning, available: \(Self.availableMemoryMB())\n")
         }
 
         let argv0 = Bundle.main.executablePath ?? "lc0"
@@ -133,6 +201,13 @@ final class EngineRunner: ObservableObject {
     private func finish(_ code: Int32) {
         flushTimer?.invalidate()
         flushTimer = nil
+        memoryTimer?.invalidate()
+        memoryTimer = nil
+        if let memoryWarning { NotificationCenter.default.removeObserver(memoryWarning) }
+        memoryWarning = nil
+        buffer.writeToFile("\n[lc0 exited with code \(code)]\n")
+        buffer.closeFile()
+        UserDefaults.standard.set(false, forKey: Self.runInProgressKey)
         isRunning = false
         UIApplication.shared.isIdleTimerDisabled = false
         log += "\n[lc0 exited with code \(code)]\n"

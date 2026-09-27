@@ -13,6 +13,7 @@ struct BenchmarkView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if let crashLog = runner.crashedRunLog { crashSection(crashLog) }
                 networkSection
                 if config.mode != .describenet { backendSection }
                 modeSection
@@ -154,6 +155,37 @@ struct BenchmarkView: View {
                 NpsChart(series: [result])
                     .frame(height: 200)
             }
+            if let lowest = runner.lowestAvailableMemory {
+                LabeledContent("Lowest free memory during run",
+                               value: ByteCountFormatter.string(fromByteCount: Int64(lowest), countStyle: .memory))
+            }
+        }
+    }
+
+    private func crashSection(_ crashLog: String) -> some View {
+        Section {
+            Text("The app was closed while lc0 was running. The last lines usually say why: if \"available memory\" drops toward 0 MB, iOS killed it for using too much memory.")
+                .font(.callout)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    Text(crashLog)
+                        .font(.caption2.monospaced())
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                    Color.clear.frame(height: 1).id("crashBottom")
+                }
+                .frame(height: 220)
+                .onAppear { proxy.scrollTo("crashBottom", anchor: .bottom) }
+            }
+            HStack {
+                Button("Copy log") { UIPasteboard.general.string = crashLog }
+                Spacer()
+                Button("Dismiss", role: .destructive) { runner.crashedRunLog = nil }
+            }
+            .buttonStyle(.borderless)
+        } header: {
+            Label("Previous run crashed", systemImage: "exclamationmark.octagon.fill")
+                .foregroundStyle(.red)
         }
     }
 

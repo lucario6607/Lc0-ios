@@ -275,7 +275,8 @@ final class NetStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             let items = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
             for url in items {
                 let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                if !isDir && url.lastPathComponent != "results.json" && !url.lastPathComponent.hasPrefix(".") {
+                if !isDir && !["results.json", "last-run.log"].contains(url.lastPathComponent)
+                    && !url.lastPathComponent.hasPrefix(".") {
                     found.append(url)
                 }
             }
