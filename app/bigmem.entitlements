@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Lets big nets (BT4 class) load: the default per-app limit on a 12 GB
+	     iPhone is ~3.3 GB. Sideloadly carries entitlements over from the
+	     app's existing (ad-hoc) signature when re-signing. -->
+	<key>com.apple.developer.kernel.increased-memory-limit</key>
+	<true/>
+</dict>
+</plist>

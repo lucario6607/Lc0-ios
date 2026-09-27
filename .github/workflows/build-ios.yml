@@ -90,15 +90,24 @@ jobs:
 
       - name: Package .ipa
         run: |
-          mkdir -p dist/Payload
-          cp -R "$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app" dist/Payload/
-          (cd dist && zip -qry LeelaBench.ipa Payload)
-          ls -lh dist/LeelaBench.ipa
+          APP="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app"
+          mkdir -p dist/plain/Payload dist/bigmem/Payload
+          cp -R "$APP" dist/plain/Payload/
+          (cd dist/plain && zip -qry ../LeelaBench.ipa Payload)
+          # Same app, ad-hoc signed with the increased-memory-limit entitlement
+          # so Sideloadly carries it over when re-signing.
+          cp -R "$APP" dist/bigmem/Payload/
+          codesign -f -s - --entitlements app/bigmem.entitlements dist/bigmem/Payload/LeelaBench.app
+          codesign -d --entitlements - dist/bigmem/Payload/LeelaBench.app
+          (cd dist/bigmem && zip -qry ../LeelaBench-bigmem.ipa Payload)
+          ls -lh dist/*.ipa
 
       - uses: actions/upload-artifact@v4
         with:
           name: LeelaBench-ipa
-          path: dist/LeelaBench.ipa
+          path: |
+            dist/LeelaBench.ipa
+            dist/LeelaBench-bigmem.ipa
 
       - name: Upload logs on failure
         if: failure()
@@ -113,4 +122,6 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/LeelaBench.ipa
+          files: |
+            dist/LeelaBench.ipa
+            dist/LeelaBench-bigmem.ipa
