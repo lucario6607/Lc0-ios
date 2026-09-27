@@ -66,13 +66,20 @@ jobs:
 
       - name: Check backends are linked in
         run: |
-          BIN="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app/LeelaBench"
-          ls -lh "$BIN"
+          set +e
+          APP="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app"
+          BIN="$APP/$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP/Info.plist")"
+          echo "::notice::app binary $(stat -f%z "$BIN") bytes; liblc0_all.a $(stat -f%z app/Vendor/lib/liblc0_all.a) bytes; $(wc -l < build/archives.txt) archives merged; $(grep LC0_ONNX app/Vendor/lc0.xcconfig)"
+          strings -a "$BIN" > "$RUNNER_TEMP/strings.txt"
+          missing=""
           for backend in metal blas eigen onnx-coreml; do
-            if strings "$BIN" | grep -qx "$backend"; then echo "found $backend"
-            else echo "::error::backend '$backend' missing from app binary"; missing=1; fi
+            grep -qx -- "$backend" "$RUNNER_TEMP/strings.txt" || missing="$missing $backend"
           done
-          test -z "$missing"
+          if [ -n "$missing" ]; then
+            echo "::error::backends missing from app binary:$missing"
+            exit 1
+          fi
+          echo "::notice::all backends present"
 
       - name: Package .ipa
         run: |
