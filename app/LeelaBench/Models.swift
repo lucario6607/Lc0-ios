@@ -31,6 +31,7 @@ enum Backend: String, CaseIterable, Codable, Identifiable {
     case metal, blas, eigen
     case onnxCoreML = "onnx-coreml"
     case onnxCPU = "onnx-cpu"
+    case coreml
     case random
     var id: String { rawValue }
 
@@ -41,6 +42,7 @@ enum Backend: String, CaseIterable, Codable, Identifiable {
         case .eigen: return "Eigen (CPU)"
         case .onnxCoreML: return "Core ML (via ONNX)"
         case .onnxCPU: return "ONNX Runtime (CPU)"
+        case .coreml: return "Core ML (native)"
         case .random: return "Random (no network)"
         }
     }
@@ -50,14 +52,20 @@ enum Backend: String, CaseIterable, Codable, Identifiable {
         case .metal: return "batch=64"
         case .blas, .eigen: return "batch_size=256"
         case .onnxCoreML, .onnxCPU: return "batch=64"
-        case .random: return ""
+        case .coreml, .random: return ""
         }
     }
 
     var isOnnx: Bool { self == .onnxCoreML || self == .onnxCPU }
 
+    /// Runs a model converted by the "Convert net to Core ML" workflow instead of a net.
+    var usesCoreMLModel: Bool { self == .coreml }
+
+    /// Backends where a batch-size sweep makes sense (each size is its own compiled model).
+    var supportsSweep: Bool { isOnnx || self == .coreml }
+
     static var available: [Backend] {
-        allCases.filter { !$0.isOnnx || BuildInfo.hasOnnx }
+        allCases.filter { (!$0.isOnnx || BuildInfo.hasOnnx) && ($0 != .coreml || BuildInfo.hasCoreML) }
     }
 }
 
@@ -76,6 +84,14 @@ enum CoreMLUnits: Int, CaseIterable, Codable, Identifiable {
         switch self {
         case .cpuAndGPU: return "GPU"
         case .cpuAndNeuralEngine: return "ANE"
+        case .all: return "all"
+        }
+    }
+    /// Value of the native coreml backend's `units` option.
+    var unitsOption: String {
+        switch self {
+        case .cpuAndGPU: return "gpu"
+        case .cpuAndNeuralEngine: return "ne"
         case .all: return "all"
         }
     }
@@ -105,6 +121,10 @@ struct BenchConfig: Codable, Equatable {
     var onnxSessions = 0
     /// Batch size of the smallest session (lc0 `batch`). 0 = lc0's default (16 for Core ML).
     var onnxBatch = 0
+    /// Converted Core ML model (a *.lc0coreml folder name) for the coreml backend.
+    var coremlModel = ""
+    /// coreml backend batch size; 0 = pick per call from the model's sizes.
+    var coremlBatch = 0
     var mode = BenchMode.backendbench
     var threads = 1
 
@@ -144,13 +164,23 @@ struct BenchConfig: Codable, Equatable {
         }
     }
 
+    /// The net or Core ML model this run uses, by file name.
+    var selectedName: String { backend.usesCoreMLModel ? coremlModel : network }
+
     var effectiveBackendOpts: String {
-        backendOpts(sessions: onnxSessions, batch: onnxBatch)
+        backend.usesCoreMLModel ? backendOpts(sessions: 0, batch: coremlBatch)
+                                : backendOpts(sessions: onnxSessions, batch: onnxBatch)
     }
 
-    /// `sessions`/`batch` of 0 leave lc0's defaults.
-    func backendOpts(sessions: Int, batch: Int) -> String {
+    /// `sessions`/`batch` of 0 leave lc0's defaults. `modelPath` is the coreml
+    /// backend's model folder (left out for display).
+    func backendOpts(sessions: Int, batch: Int, modelPath: String? = nil) -> String {
         var parts: [String] = []
+        if backend == .coreml {
+            if let modelPath { parts.append("model='\(modelPath)'") }
+            parts.append("units=\(coreMLUnits.unitsOption)")
+            if batch > 0 { parts.append("batch=\(batch)") }
+        }
         if backend == .onnxCoreML { parts.append("gpu=\(coreMLUnits.rawValue)") }
         if backend.isOnnx && precision != .auto { parts.append("fp16=\(precision == .fp16)") }
         if backend.isOnnx && sessions > 0 { parts.append("steps=\(sessions)") }
@@ -165,14 +195,20 @@ struct BenchConfig: Codable, Equatable {
         switch backend {
         case .onnxCoreML: return "coreml-\(coreMLUnits.shortTitle) \(effectivePrecision)\(sessions)"
         case .onnxCPU: return "onnx-cpu \(effectivePrecision)\(sessions)"
+        case .coreml:
+            let batch = mode == .sweep ? " sweep" : coremlBatch > 0 ? " b\(coremlBatch)" : ""
+            return "coreml-native-\(coreMLUnits.shortTitle)\(batch)"
         default: return backend.rawValue
         }
     }
 
     /// One sweep step: a single session of `batch`, measured at exactly `batch`.
     func sweepArguments(networkPath: String, batch: Int) -> [String] {
-        var args = ["backendbench", "--weights=\(networkPath)", "--backend=\(backend.rawValue)",
-                    "--backend-opts=\(backendOpts(sessions: 1, batch: batch))",
+        let coreml = backend.usesCoreMLModel
+        let opts = coreml ? backendOpts(sessions: 0, batch: batch, modelPath: networkPath)
+                          : backendOpts(sessions: 1, batch: batch)
+        var args = ["backendbench", "--weights=\(coreml ? "" : networkPath)", "--backend=\(backend.rawValue)",
+                    "--backend-opts=\(opts)",
                     "--threads=\(threads)", "--batches=\(batches)",
                     "--start-batch-size=\(batch)", "--max-batch-size=\(batch)", "--batch-step=1"]
         args += extraArgs.split(whereSeparator: \.isWhitespace).map(String.init)
@@ -183,8 +219,11 @@ struct BenchConfig: Codable, Equatable {
         if mode == .sweep {
             return sweepArguments(networkPath: networkPath, batch: parsedSweepSizes.first ?? 64)
         }
-        var args = [mode.rawValue, "--weights=\(networkPath)", "--backend=\(backend.rawValue)"]
-        let opts = effectiveBackendOpts
+        // The coreml backend loads its model folder itself; no lc0 weights file.
+        let coreml = backend.usesCoreMLModel
+        var args = [mode.rawValue, "--weights=\(coreml ? "" : networkPath)", "--backend=\(backend.rawValue)"]
+        let opts = coreml ? backendOpts(sessions: 0, batch: coremlBatch, modelPath: networkPath)
+                          : effectiveBackendOpts
         if !opts.isEmpty { args.append("--backend-opts=\(opts)") }
         args.append("--threads=\(threads)")
         switch mode {
@@ -219,6 +258,8 @@ struct BenchConfig: Codable, Equatable {
         precision = value(.precision, d.precision)
         onnxSessions = value(.onnxSessions, d.onnxSessions)
         onnxBatch = value(.onnxBatch, d.onnxBatch)
+        coremlModel = value(.coremlModel, d.coremlModel)
+        coremlBatch = value(.coremlBatch, d.coremlBatch)
         mode = value(.mode, d.mode)
         threads = value(.threads, d.threads)
         batches = value(.batches, d.batches)
@@ -387,7 +428,7 @@ extension BenchResult {
             date: outcome.started,
             device: DeviceInfo.summary,
             mode: config.mode,
-            network: config.network,
+            network: config.selectedName,
             backend: config.backendLabel,
             backendOpts: config.effectiveBackendOpts,
             threads: config.threads,

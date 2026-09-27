@@ -80,7 +80,7 @@ jobs:
           echo "::notice::app binary $(stat -f%z "$BIN") bytes; liblc0.a $(stat -f%z app/Vendor/lib/liblc0.a) bytes; $(grep LC0_ONNX app/Vendor/lc0.xcconfig)"
           strings -a "$BIN" > "$RUNNER_TEMP/strings.txt"
           missing=""
-          for backend in metal blas eigen onnx-coreml; do
+          for backend in metal blas eigen onnx-coreml coreml; do
             grep -qx -- "$backend" "$RUNNER_TEMP/strings.txt" || missing="$missing $backend"
           done
           if [ -n "$missing" ]; then

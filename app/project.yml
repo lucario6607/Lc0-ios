@@ -31,6 +31,7 @@ targets:
         CFBundleDisplayName: LeelaBench
         LC0Version: $(LC0_VERSION_INFO)
         LC0Onnx: $(LC0_ONNX)
+        LC0CoreML: $(LC0_COREML)
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

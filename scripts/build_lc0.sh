@@ -106,6 +106,7 @@ build_lc0() {  # $1 = true/false: include ONNX backends
     -Dcudnn=false \
     -Dnvcc=false \
     -Dmetal=enabled \
+    -Dcoreml=true \
     -Daccelerate=true \
     -Donnx="$with_onnx" \
     -Donnx_include="$ORT_DIR/include" \
@@ -150,10 +151,10 @@ fi
 
 LDFLAGS="-Wl,-force_load,\$(PROJECT_DIR)/Vendor/lib/liblc0.a $DEPS_FLAG -lz -lc++ -framework Foundation -framework Metal"
 LDFLAGS="$LDFLAGS -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph"
-LDFLAGS="$LDFLAGS -framework Accelerate"
+LDFLAGS="$LDFLAGS -framework Accelerate -framework CoreML"
 if [ "$ONNX_BUILT" = true ]; then
   cp "$ORT_DIR/lib/libonnxruntime.a" "$VENDOR/lib/"
-  LDFLAGS="$LDFLAGS -lonnxruntime -framework CoreML -framework Network"
+  LDFLAGS="$LDFLAGS -lonnxruntime -framework Network"
 else
   rm -f "$VENDOR/lib/libonnxruntime.a"
 fi
@@ -164,6 +165,7 @@ LIBRARY_SEARCH_PATHS = \$(inherited) \$(PROJECT_DIR)/Vendor/lib
 OTHER_LDFLAGS = \$(inherited) $LDFLAGS
 LC0_VERSION_INFO = $LC0_REF ($LC0_REV)
 LC0_ONNX = $ONNX_BUILT
+LC0_COREML = true
 EOF
 
 echo "::notice::Built lc0 $LC0_REF ($LC0_REV), onnx=$ONNX_BUILT, liblc0.a $(stat -f%z "$VENDOR/lib/liblc0.a") bytes, $(wc -l < "$WORK/deps.txt") dependency archives"

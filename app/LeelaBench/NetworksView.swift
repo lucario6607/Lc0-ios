@@ -32,6 +32,32 @@ struct NetworksView: View {
                     Text("You can also copy .pb.gz files into LeelaBench's folder with the Files app.")
                 }
 
+                Section {
+                    ForEach(nets.coremlModels) { model in
+                        NavigationLink {
+                            CoreMLModelDetailView(model: model)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(model.displayName).lineLimit(2)
+                                Text("\(model.precision.uppercased()) · batches \(model.batchSizes.map(String.init).joined(separator: ", ")) · \(ByteCountFormatter.string(fromByteCount: model.bytes, countStyle: .file))")
+                                    .font(.caption).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    .onDelete { offsets in
+                        offsets.map { nets.coremlModels[$0].url }.forEach(nets.delete)
+                    }
+                    if nets.unpacking {
+                        HStack { ProgressView(); Text("Unpacking Core ML model…").foregroundStyle(.secondary) }
+                    } else if nets.coremlModels.isEmpty {
+                        Text("No Core ML models yet.").foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Core ML models")
+                } footer: {
+                    Text("For the native Core ML backend. Convert a net with the \"Convert net to Core ML\" workflow on GitHub, then paste the .lc0coreml.aar link from its release below, or import the file.")
+                }
+
                 Section("Add a network") {
                     Button {
                         showImporter = true
@@ -159,6 +185,42 @@ struct NetworkDetailView: View {
             let lines = outcome.output.split(separator: "\n", omittingEmptySubsequences: false)
                 .drop { !$0.contains(":") }
             description = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+    }
+}
+
+/// A converted Core ML model's details.
+struct CoreMLModelDetailView: View {
+    @EnvironmentObject private var nets: NetStore
+    @Environment(\.dismiss) private var dismiss
+    let model: CoreMLModelInfo
+    @State private var confirmDelete = false
+
+    var body: some View {
+        List {
+            Section("Model") {
+                LabeledContent("Network", value: model.displayName)
+                LabeledContent("Precision", value: model.precision.uppercased())
+                LabeledContent("Batch sizes", value: model.batchSizes.map(String.init).joined(separator: ", "))
+                LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.bytes, countStyle: .file))
+            }
+            Section {
+                Text("Each batch size is a separately compiled function sharing one copy of the weights. The first run of each size on this device is slower while Core ML prepares it for the Neural Engine or GPU.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
+            Section {
+                Button("Delete model", role: .destructive) { confirmDelete = true }
+            }
+        }
+        .navigationTitle(model.displayName)
+        .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("Delete \(model.displayName)?", isPresented: $confirmDelete,
+                            titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                nets.delete(model.url)
+                dismiss()
+            }
         }
     }
 }

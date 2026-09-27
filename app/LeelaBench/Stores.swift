@@ -1,5 +1,7 @@
+import AppleArchive
 import Foundation
 import Metal
+import System
 import UIKit
 
 // MARK: - Results on disk
@@ -90,12 +92,48 @@ enum FileLocations {
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
     }()
+    /// Converted Core ML models: one *.lc0coreml folder each.
+    static let coreml: URL = {
+        let url = documents.appendingPathComponent("coreml", isDirectory: true)
+        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+        return url
+    }()
+}
+
+/// A model made by the "Convert net to Core ML" workflow.
+struct CoreMLModelInfo: Identifiable, Hashable {
+    var id: String { folderName }
+    let url: URL
+    let displayName: String
+    let batchSizes: [Int]
+    let precision: String
+    let bytes: Int64
+
+    var folderName: String { url.lastPathComponent }
+
+    init?(url: URL) {
+        guard let data = try? Data(contentsOf: url.appendingPathComponent("lc0coreml.json")),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        else { return nil }
+        self.url = url
+        displayName = json["name"] as? String ?? url.deletingPathExtension().lastPathComponent
+        batchSizes = (json["batch_sizes"] as? [Int] ?? []).sorted()
+        precision = json["precision"] as? String ?? "?"
+        var total: Int64 = 0
+        let files = FileManager.default.enumerator(at: url, includingPropertiesForKeys: [.fileSizeKey])
+        while let file = files?.nextObject() as? URL {
+            total += Int64((try? file.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+        }
+        bytes = total
+    }
 }
 
 @MainActor
 final class NetStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
     @Published private(set) var nets: [URL] = []
+    @Published private(set) var coremlModels: [CoreMLModelInfo] = []
     @Published private(set) var downloadProgress: Double?
+    @Published private(set) var unpacking = false
     @Published var lastError: String?
 
     private var downloadContinuation: CheckedContinuation<URL, Error>?
@@ -115,21 +153,82 @@ final class NetStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             for url in items {
                 let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
                 if !isDir && !["results.json", "last-run.log"].contains(url.lastPathComponent)
-                    && !url.lastPathComponent.hasPrefix(".") {
+                    && !url.lastPathComponent.hasPrefix(".") && url.pathExtension != "aar" {
                     found.append(url)
                 }
             }
         }
         nets = found.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+
+        let folders = (try? fm.contentsOfDirectory(at: FileLocations.coreml, includingPropertiesForKeys: nil)) ?? []
+        coremlModels = folders.filter { $0.pathExtension == "lc0coreml" }
+            .compactMap(CoreMLModelInfo.init(url:))
+            .sorted { $0.displayName.localizedStandardCompare($1.displayName) == .orderedAscending }
     }
 
     func url(named name: String) -> URL? {
         nets.first { $0.lastPathComponent == name }
     }
 
+    func coremlModel(named folder: String) -> CoreMLModelInfo? {
+        coremlModels.first { $0.folderName == folder }
+    }
+
+    /// Unpacks a *.lc0coreml.aar from the conversion workflow into Documents/coreml.
+    func installArchive(_ archive: URL) async {
+        unpacking = true
+        defer { unpacking = false }
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try NetStore.extract(archive, to: FileLocations.coreml)
+            }.value
+        } catch {
+            lastError = "Couldn't unpack \(archive.lastPathComponent): \(error.localizedDescription)"
+        }
+        refresh()
+    }
+
+    private struct ArchiveError: LocalizedError {
+        var errorDescription: String? { "not a valid .aar archive" }
+    }
+
+    nonisolated private static func extract(_ archive: URL, to dir: URL) throws {
+        guard let file = ArchiveByteStream.fileStream(
+                path: FilePath(archive.path), mode: .readOnly, options: [],
+                permissions: FilePermissions(rawValue: 0o644)),
+              let decompress = ArchiveByteStream.decompressionStream(readingFrom: file),
+              let decode = ArchiveStream.decodeStream(readingFrom: decompress),
+              let extract = ArchiveStream.extractStream(extractingTo: FilePath(dir.path),
+                                                        flags: [.ignoreOperationNotPermitted])
+        else { throw ArchiveError() }
+        defer {
+            try? extract.close()
+            try? decode.close()
+            try? decompress.close()
+            try? file.close()
+        }
+        _ = try ArchiveStream.process(readingFrom: decode, writingTo: extract)
+    }
+
     func importFile(_ source: URL) {
         let scoped = source.startAccessingSecurityScopedResource()
         defer { if scoped { source.stopAccessingSecurityScopedResource() } }
+        if source.pathExtension == "aar" {
+            // Copy first: the security-scoped URL may not outlive this call.
+            let temp = FileManager.default.temporaryDirectory.appendingPathComponent(source.lastPathComponent)
+            try? FileManager.default.removeItem(at: temp)
+            do {
+                try FileManager.default.copyItem(at: source, to: temp)
+            } catch {
+                lastError = "Import failed: \(error.localizedDescription)"
+                return
+            }
+            Task {
+                await installArchive(temp)
+                try? FileManager.default.removeItem(at: temp)
+            }
+            return
+        }
         let dest = FileLocations.nets.appendingPathComponent(source.lastPathComponent)
         do {
             try? FileManager.default.removeItem(at: dest)
@@ -157,6 +256,12 @@ final class NetStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
             }
             session.finishTasksAndInvalidate()
             var name = remote.lastPathComponent
+            if name.hasSuffix(".aar") {
+                await installArchive(tempURL)
+                try? FileManager.default.removeItem(at: tempURL)
+                refresh()
+                return
+            }
             if name.isEmpty || !name.contains(".") { name += ".pb.gz" }
             let dest = FileLocations.nets.appendingPathComponent(name)
             try? FileManager.default.removeItem(at: dest)
@@ -214,6 +319,9 @@ final class NetStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
 enum BuildInfo {
     static var lc0Version: String {
         Bundle.main.object(forInfoDictionaryKey: "LC0Version") as? String ?? "unknown"
+    }
+    static var hasCoreML: Bool {
+        (Bundle.main.object(forInfoDictionaryKey: "LC0CoreML") as? String) == "true"
     }
     static var hasOnnx: Bool {
         (Bundle.main.object(forInfoDictionaryKey: "LC0Onnx") as? String) == "true"
