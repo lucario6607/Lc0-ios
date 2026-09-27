@@ -121,6 +121,8 @@ struct BenchConfig: Codable, Equatable {
     var numPositions = 10
     var movetimeMs = 5000
     var nodes = -1
+    /// Search batch size (lc0 --minibatch-size); 0 = what the backend suggests.
+    var minibatch = 0
 
     var extraArgs = ""
 
@@ -195,6 +197,8 @@ struct BenchConfig: Codable, Equatable {
         case .bench:
             break
         }
+        // Only the search tests have this flag; backendbench rejects it.
+        if mode.isSearch && minibatch > 0 { args.append("--minibatch-size=\(minibatch)") }
         args += extraArgs.split(whereSeparator: \.isWhitespace).map(String.init)
         return args
     }
@@ -225,6 +229,7 @@ struct BenchConfig: Codable, Equatable {
         numPositions = value(.numPositions, d.numPositions)
         movetimeMs = value(.movetimeMs, d.movetimeMs)
         nodes = value(.nodes, d.nodes)
+        minibatch = value(.minibatch, d.minibatch)
         extraArgs = value(.extraArgs, d.extraArgs)
     }
 

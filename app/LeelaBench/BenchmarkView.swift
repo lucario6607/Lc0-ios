@@ -303,13 +303,14 @@ struct BenchmarkView: View {
                 NumberRow(title: "Positions (max 34)", value: $config.numPositions, range: 1...34)
                 NumberRow(title: "Time per position (ms)", value: $config.movetimeMs, range: 100...600_000)
                 NumberRow(title: "Node limit (-1 = none)", value: $config.nodes, range: -1...1_000_000_000)
+                NumberRow(title: "Minibatch (0 = backend)", value: $config.minibatch, range: 0...1024)
             case .bench:
-                EmptyView()
+                NumberRow(title: "Minibatch (0 = backend)", value: $config.minibatch, range: 0...1024)
             }
 
             DisclosureGroup("Advanced") {
                 LabeledContent("Extra args") {
-                    TextField("--minibatch-size=64", text: $config.extraArgs)
+                    TextField("--flag=value (all tests)", text: $config.extraArgs)
                         .multilineTextAlignment(.trailing)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
