@@ -35,10 +35,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # coremltools only ships its native model writer for some Python versions.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
       - name: Install tools
         run: |
-          pip3 install --break-system-packages meson ninja coremltools onnx onnxruntime numpy
-          python3 -c "import coremltools; print('coremltools', coremltools.__version__)"
+          python -m pip install meson ninja coremltools onnx onnxruntime numpy
+          python -c "import coremltools; from coremltools.libmilstoragepython import _BlobStorageWriter; print('coremltools', coremltools.__version__)"
 
       - name: Cache lc0 (macOS, converter only)
         id: lc0cache
@@ -87,7 +92,7 @@ jobs:
       - name: Convert to Core ML
         run: |
           set +e
-          python3 tools/lc0_to_coreml.py --onnx work/net.onnx --net work/net.pb.gz \
+          python tools/lc0_to_coreml.py --onnx work/net.onnx --net work/net.pb.gz \
             --out work/out --name "${{ steps.net.outputs.name }}" \
             --batch-sizes "${{ steps.req.outputs.sizes }}" --precision "${{ steps.req.outputs.precision }}" \
             > work/convert.log 2>&1
@@ -95,7 +100,8 @@ jobs:
           cat work/convert.log
           # Logs need a sign-in; annotations don't.
           if [ $status -ne 0 ]; then
-            grep -E "Error|error|Exception|Traceback|File \"" work/convert.log | tail -15 \
+            # GitHub shows 10 annotations per step: the actual error line first.
+            { tail -3 work/convert.log; grep -E "lc0_to_coreml.py" work/convert.log | tail -3; } \
               | while IFS= read -r line; do echo "::error::${line:0:900}"; done
             exit $status
           fi
@@ -104,7 +110,7 @@ jobs:
       - name: Check against ONNX Runtime
         run: |
           smallest="$(echo '${{ steps.req.outputs.sizes }}' | tr ',' '\n' | sort -n | head -1)"
-          python3 tools/verify_coreml.py --onnx work/net.onnx \
+          python tools/verify_coreml.py --onnx work/net.onnx \
             --package "work/out/${{ steps.net.outputs.name }}.mlpackage" \
             --meta work/out/lc0coreml.json --batch-sizes "$smallest,64"
 
