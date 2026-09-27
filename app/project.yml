@@ -1,0 +1,46 @@
+name: LeelaBench
+options:
+  deploymentTarget:
+    iOS: "16.0"
+  createIntermediateGroups: true
+configFiles:
+  Debug: Vendor/lc0.xcconfig
+  Release: Vendor/lc0.xcconfig
+targets:
+  LeelaBench:
+    type: application
+    platform: iOS
+    scheme: {}
+    sources:
+      - path: LeelaBench
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: org.lczero.leelabench
+        PRODUCT_NAME: LeelaBench
+        MARKETING_VERSION: "1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: LeelaBench/LeelaBench-Bridging-Header.h
+        ENABLE_BITCODE: NO
+        DEAD_CODE_STRIPPING: YES
+        GENERATE_INFOPLIST_FILE: NO
+    info:
+      path: LeelaBench/Info.plist
+      properties:
+        CFBundleDisplayName: LeelaBench
+        LC0Version: $(LC0_VERSION_INFO)
+        LC0Onnx: $(LC0_ONNX)
+        UILaunchScreen: {}
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        UIApplicationSupportsIndirectInputEvents: true
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight
+        UISupportedInterfaceOrientations~ipad:
+          - UIInterfaceOrientationPortrait
+          - UIInterfaceOrientationPortraitUpsideDown
+          - UIInterfaceOrientationLandscapeLeft
+          - UIInterfaceOrientationLandscapeRight

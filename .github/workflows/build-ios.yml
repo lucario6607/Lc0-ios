@@ -1,0 +1,92 @@
+name: Build iOS app
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      lc0_ref:
+        description: lc0 branch or tag to build
+        default: release/0.33
+      ort_version:
+        description: ONNX Runtime version for onnx-coreml (empty = no ONNX backends)
+        default: "1.30.0"
+        required: false
+
+permissions:
+  contents: write  # only used to attach the .ipa to a release on v* tags
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      LC0_REF: ${{ inputs.lc0_ref || 'release/0.33' }}
+      ORT_VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.ort_version || '1.30.0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          pip3 install --break-system-packages meson ninja
+          brew install xcodegen
+          xcodebuild -version
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/onnxruntime-*
+            build/lc0/subprojects/packagecache
+          key: deps-${{ env.LC0_REF }}-${{ env.ORT_VERSION }}-${{ hashFiles('patches/**', 'scripts/build_lc0.sh') }}
+
+      - name: Build lc0 for iOS
+        run: bash scripts/build_lc0.sh
+
+      - name: Generate Xcode project
+        working-directory: app
+        run: xcodegen generate
+
+      - name: Build app (unsigned)
+        working-directory: app
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project LeelaBench.xcodeproj \
+            -scheme LeelaBench \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/dd" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            build | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E "error|warning: .*lc0|BUILD" || true
+          test -d "$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app"
+
+      - name: Package .ipa
+        run: |
+          mkdir -p dist/Payload
+          cp -R "$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app" dist/Payload/
+          (cd dist && zip -qry LeelaBench.ipa Payload)
+          ls -lh dist/LeelaBench.ipa
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LeelaBench-ipa
+          path: dist/LeelaBench.ipa
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            ${{ runner.temp }}/xcodebuild.log
+            build/meson/meson-logs/
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/LeelaBench.ipa

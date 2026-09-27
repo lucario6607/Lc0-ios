@@ -1,0 +1,6 @@
+build/
+dist/
+app/Vendor/
+app/*.xcodeproj/
+app/LeelaBench/Info.plist
+.DS_Store

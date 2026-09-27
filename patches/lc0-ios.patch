@@ -1,0 +1,121 @@
+diff --git a/meson.build b/meson.build
+index b954824..c1d7485 100644
+--- a/meson.build
++++ b/meson.build
+@@ -711,11 +711,14 @@ if get_option('build_backends')
+     add_project_arguments('-fobjc-arc', language : 'objcpp')
+ 
+     # Minimum MacOS version = 12.6.1
+-    macos_min_version = '12.6'
+-    add_project_arguments(
+-      '-mmacosx-version-min=' + macos_min_version,
+-      language: ['c', 'cpp', 'objc', 'objcpp']
+-    )
++    # (The iOS deployment target is set by the cross file instead.)
++    if not get_option('ios_library')
++      macos_min_version = '12.6'
++      add_project_arguments(
++        '-mmacosx-version-min=' + macos_min_version,
++        language: ['c', 'cpp', 'objc', 'objcpp']
++      )
++    endif
+   endif
+ 
+   ## ~~~~~~~~
+@@ -934,7 +937,14 @@ endif
+ configure_file(output : 'default_backend.h',
+                configuration : default_backend_h)
+ 
+-if get_option('lc0')
++if get_option('lc0') and get_option('ios_library')
++  # iOS apps cannot spawn processes, so the engine is linked into the app and
++  # entered through lc0_main() instead of main().
++  files += common_files
++  static_library('lc0', 'src/main.cc',
++       files, include_directories: includes, dependencies: deps,
++       cpp_args: ['-DLC0_LIBRARY_MAIN'], install: true)
++elif get_option('lc0')
+   files += common_files
+   executable('lc0', 'src/main.cc',
+        files, include_directories: includes, dependencies: deps, install: true)
+diff --git a/meson_options.txt b/meson_options.txt
+index ec5c539..21a3913 100644
+--- a/meson_options.txt
++++ b/meson_options.txt
+@@ -269,3 +269,8 @@ option('nvcc',
+        type: 'boolean',
+        value: true,
+        description: 'Use nvcc: required for cuda, optional for onnx')
++
++option('ios_library',
++       type: 'boolean',
++       value: false,
++       description: 'Build lc0 as a static library (lc0_main entry point) for embedding in an iOS app')
+diff --git a/src/main.cc b/src/main.cc
+index dc83a19..fff5f0c 100644
+--- a/src/main.cc
++++ b/src/main.cc
+@@ -76,7 +76,11 @@ void ChooseAndRunEngine() {
+ }
+ }  // namespace lczero
+ 
++#ifdef LC0_LIBRARY_MAIN
++extern "C" int lc0_main(int argc, const char** argv) {
++#else
+ int main(int argc, const char** argv) {
++#endif
+   LCTRACE_INITIALIZE;
+   using namespace lczero;
+   EscCodes::Init();
+@@ -137,6 +141,12 @@ int main(int argc, const char** argv) {
+     }
+   } catch (std::exception& e) {
+     std::cerr << "Unhandled exception: " << e.what() << std::endl;
++#ifdef LC0_LIBRARY_MAIN
++    // Don't take the host app down with us.
++    return 1;
++#else
+     abort();
++#endif
+   }
++  return 0;
+ }
+diff --git a/src/neural/backends/metal/mps/MetalNetworkBuilder.mm b/src/neural/backends/metal/mps/MetalNetworkBuilder.mm
+index 7791d13..ad5bcf5 100644
+--- a/src/neural/backends/metal/mps/MetalNetworkBuilder.mm
++++ b/src/neural/backends/metal/mps/MetalNetworkBuilder.mm
+@@ -39,7 +39,13 @@ MetalNetworkBuilder::~MetalNetworkBuilder(void){}
+ std::string MetalNetworkBuilder::init(int gpu_id)
+ {
+     // All metal devices.
++#if TARGET_OS_OSX
+     NSArray<id<MTLDevice>> * devices = MTLCopyAllDevices();
++#else
++    // MTLCopyAllDevices() is macOS-only; iOS has exactly one GPU.
++    id<MTLDevice> systemDevice = MTLCreateSystemDefaultDevice();
++    NSArray<id<MTLDevice>> * devices = systemDevice ? @[systemDevice] : @[];
++#endif
+ 
+     if ((NSUInteger)gpu_id >= [devices count]) {
+         // No GPU device matching ID.
+diff --git a/src/neural/backends/metal/mps/NetworkGraph.mm b/src/neural/backends/metal/mps/NetworkGraph.mm
+index 322308e..89712a4 100644
+--- a/src/neural/backends/metal/mps/NetworkGraph.mm
++++ b/src/neural/backends/metal/mps/NetworkGraph.mm
+@@ -117,9 +117,16 @@ static const NSInteger kMinSubBatchSize = 20;
+     NSMutableDictionary * graphs = [Lc0NetworkGraph getGraphs];
+ 
+     @synchronized (self) {
++#if TARGET_OS_IPHONE
++        // On iOS the engine runs in-process and is re-entered for every
++        // benchmark, possibly with a different net: always start a fresh graph
++        // so tensors from a previous network are not reused.
++        graphs[index] = [[Lc0NetworkGraph alloc] initWithDevice:device];
++#else
+         if (graphs[index] == nil) {
+             graphs[index] = [[Lc0NetworkGraph alloc] initWithDevice:device];
+         }
++#endif
+     }
+ }
+ 
