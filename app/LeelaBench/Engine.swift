@@ -85,6 +85,13 @@ final class LogBuffer: @unchecked Sendable {
     }
 }
 
+/// Free memory at a moment during a run.
+struct MemorySample: Identifiable {
+    let id: Int
+    let seconds: Double
+    let freeMB: Int
+}
+
 /// Everything known about a finished lc0 invocation.
 struct RunOutcome {
     var output: String
@@ -107,6 +114,9 @@ final class EngineRunner: ObservableObject {
     @Published private(set) var startedAt: Date?
     /// Arguments of the current (or last) run, without argv[0].
     @Published private(set) var arguments: [String] = []
+    /// Free memory once a second during the current (or last) run.
+    @Published private(set) var memorySamples: [MemorySample] = []
+    @Published private(set) var thermalNow = DeviceInfo.thermalState
     /// Output of a run that never finished — the app was killed mid-run.
     @Published var crashedRunLog: String?
     @Published private(set) var lowestAvailableMemory: Int?
@@ -149,6 +159,8 @@ final class EngineRunner: ObservableObject {
         parsed = OutputParser()
         startedAt = Date()
         thermalStart = DeviceInfo.thermalState
+        thermalNow = thermalStart
+        memorySamples = [MemorySample(id: 0, seconds: 0, freeMB: os_proc_available_memory() / 1_048_576)]
         self.completion = completion
         UIApplication.shared.isIdleTimerDisabled = true
 
@@ -171,6 +183,11 @@ final class EngineRunner: ObservableObject {
                 guard let self else { return }
                 let available = os_proc_available_memory()
                 self.lowestAvailableMemory = min(self.lowestAvailableMemory ?? available, available)
+                self.thermalNow = DeviceInfo.thermalState
+                self.memorySamples.append(MemorySample(
+                    id: self.memorySamples.count,
+                    seconds: Date().timeIntervalSince(self.startedAt ?? Date()),
+                    freeMB: available / 1_048_576))
                 self.buffer.writeToFile("[LeelaBench] available memory: \(available / 1_048_576) MB\n")
             }
         }
