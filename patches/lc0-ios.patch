@@ -1,8 +1,8 @@
 diff --git a/meson.build b/meson.build
-index b954824..c1d7485 100644
+index b954824..0e8b284 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -711,11 +711,14 @@ if get_option('build_backends')
+@@ -711,11 +711,29 @@ if get_option('build_backends')
      add_project_arguments('-fobjc-arc', language : 'objcpp')
  
      # Minimum MacOS version = 12.6.1
@@ -19,10 +19,25 @@ index b954824..c1d7485 100644
 +        language: ['c', 'cpp', 'objc', 'objcpp']
 +      )
 +    endif
++  endif
++
++  ## ~~~~~~~
++  ## Core ML
++  ## ~~~~~~~
++  # Runs models converted by LeelaBench's tools/lc0_to_coreml.py.
++  if get_option('coreml')
++    coreml_frameworks = dependency('appleframeworks',
++                                   modules : ['Foundation', 'CoreML'],
++                                   required: true)
++    add_languages('objc', 'objcpp', native: false, required: true)
++    deps += coreml_frameworks
++    files += 'src/neural/backends/coreml/network_coreml.mm'
++    add_project_arguments('-fobjc-arc', language : 'objcpp')
++    has_backends = true
    endif
  
    ## ~~~~~~~~
-@@ -934,7 +937,14 @@ endif
+@@ -934,7 +952,14 @@ endif
  configure_file(output : 'default_backend.h',
                 configuration : default_backend_h)
  
@@ -39,10 +54,10 @@ index b954824..c1d7485 100644
    executable('lc0', 'src/main.cc',
         files, include_directories: includes, dependencies: deps, install: true)
 diff --git a/meson_options.txt b/meson_options.txt
-index ec5c539..21a3913 100644
+index ec5c539..74ed8c5 100644
 --- a/meson_options.txt
 +++ b/meson_options.txt
-@@ -269,3 +269,8 @@ option('nvcc',
+@@ -269,3 +269,13 @@ option('nvcc',
         type: 'boolean',
         value: true,
         description: 'Use nvcc: required for cuda, optional for onnx')
@@ -51,6 +66,11 @@ index ec5c539..21a3913 100644
 +       type: 'boolean',
 +       value: false,
 +       description: 'Build lc0 as a static library (lc0_main entry point) for embedding in an iOS app')
++
++option('coreml',
++       type: 'boolean',
++       value: false,
++       description: 'Enable the Core ML backend (models converted by LeelaBench)')
 diff --git a/src/main.cc b/src/main.cc
 index dc83a19..fff5f0c 100644
 --- a/src/main.cc
@@ -80,6 +100,318 @@ index dc83a19..fff5f0c 100644
    }
 +  return 0;
  }
+diff --git a/src/neural/backends/coreml/network_coreml.mm b/src/neural/backends/coreml/network_coreml.mm
+new file mode 100644
+index 0000000..03e46ae
+--- /dev/null
++++ b/src/neural/backends/coreml/network_coreml.mm
+@@ -0,0 +1,306 @@
++/*
++  This file is part of Leela Chess Zero.
++  Copyright (C) 2026 The LCZero Authors
++
++  Leela Chess is free software: you can redistribute it and/or modify
++  it under the terms of the GNU General Public License as published by
++  the Free Software Foundation, either version 3 of the License, or
++  (at your option) any later version.
++
++  Leela Chess is distributed in the hope that it will be useful,
++  but WITHOUT ANY WARRANTY; without even the implied warranty of
++  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++  GNU General Public License for more details.
++
++  You should have received a copy of the GNU General Public License
++  along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
++*/
++
++// Runs a network converted to Core ML by LeelaBench's tools/lc0_to_coreml.py.
++//
++// The model directory holds model.mlmodelc (one function per batch size,
++// "b1", "b8", ...) and lc0coreml.json (input/output names and the network
++// format). No lc0 weights file is loaded: use --weights= (empty).
++//
++// Backend options:
++//   model='<dir>'   the converted model directory (required)
++//   units=all|ne|gpu|cpu   Core ML compute units (default all)
++//   batch=N         only use the batch-size-N function (pads smaller batches)
++
++#import <CoreML/CoreML.h>
++#import <Foundation/Foundation.h>
++
++#include <algorithm>
++#include <map>
++#include <mutex>
++#include <string>
++#include <vector>
++
++#include "neural/factory.h"
++#include "neural/network.h"
++#include "utils/exception.h"
++#include "utils/fp16_utils.h"
++#include "utils/logging.h"
++
++namespace lczero {
++namespace coreml_backend {
++namespace {
++
++constexpr int kNumOutputPolicy = 1858;
++
++class CoreMLNetwork;
++
++class CoreMLComputation : public NetworkComputation {
++ public:
++  explicit CoreMLComputation(CoreMLNetwork* network) : network_(network) {}
++
++  void AddInput(InputPlanes&& input) override { inputs_.emplace_back(std::move(input)); }
++  void ComputeBlocking() override;
++  int GetBatchSize() const override { return static_cast<int>(inputs_.size()); }
++
++  float GetQVal(int sample) const override {
++    if (!wdl_.empty()) return wdl_[sample * 3 + 0] - wdl_[sample * 3 + 2];
++    return value_[sample];
++  }
++  float GetDVal(int sample) const override {
++    return wdl_.empty() ? 0.0f : wdl_[sample * 3 + 1];
++  }
++  float GetPVal(int sample, int move_id) const override {
++    return policy_[sample * kNumOutputPolicy + move_id];
++  }
++  float GetMVal(int sample) const override {
++    return mlh_.empty() ? 0.0f : mlh_[sample];
++  }
++
++ private:
++  CoreMLNetwork* network_;
++  std::vector<InputPlanes> inputs_;
++  std::vector<float> policy_, wdl_, value_, mlh_;
++
++  friend class CoreMLNetwork;
++};
++
++class CoreMLNetwork : public Network {
++ public:
++  explicit CoreMLNetwork(const OptionsDict& options) {
++    @autoreleasepool {
++      const std::string dir = options.Get<std::string>("model");
++      NSString* dirPath = [NSString stringWithUTF8String:dir.c_str()];
++      model_url_ = [NSURL fileURLWithPath:[dirPath stringByAppendingPathComponent:@"model.mlmodelc"]];
++
++      NSData* json = [NSData dataWithContentsOfFile:[dirPath stringByAppendingPathComponent:@"lc0coreml.json"]];
++      if (!json) throw Exception("coreml: no lc0coreml.json in " + dir);
++      NSDictionary* meta = [NSJSONSerialization JSONObjectWithData:json options:0 error:nil];
++      if (![meta isKindOfClass:[NSDictionary class]]) throw Exception("coreml: bad lc0coreml.json");
++
++      input_name_ = meta[@"input"];
++      NSDictionary* outputs = meta[@"outputs"];
++      policy_name_ = outputs[@"policy"];
++      wdl_name_ = outputs[@"wdl"];
++      value_name_ = outputs[@"value"];
++      mlh_name_ = outputs[@"mlh"];
++      if (!input_name_ || !policy_name_ || (!wdl_name_ && !value_name_)) {
++        throw Exception("coreml: lc0coreml.json is missing input/output names");
++      }
++      for (NSNumber* b in meta[@"batch_sizes"]) batch_sizes_.push_back(b.intValue);
++      std::sort(batch_sizes_.begin(), batch_sizes_.end());
++      if (batch_sizes_.empty()) throw Exception("coreml: no batch sizes in model");
++
++      NSDictionary* format = meta[@"format"];
++      capabilities_.input_format = static_cast<pblczero::NetworkFormat::InputFormat>(
++          [format[@"input"] intValue]);
++      capabilities_.output_format = wdl_name_ ? pblczero::NetworkFormat::OUTPUT_WDL
++                                              : pblczero::NetworkFormat::OUTPUT_CLASSICAL;
++      capabilities_.moves_left = mlh_name_
++          ? static_cast<pblczero::NetworkFormat::MovesLeftFormat>([format[@"moves_left"] intValue])
++          : pblczero::NetworkFormat::MOVES_LEFT_NONE;
++      if (mlh_name_ && capabilities_.moves_left == pblczero::NetworkFormat::MOVES_LEFT_NONE) {
++        capabilities_.moves_left = pblczero::NetworkFormat::MOVES_LEFT_V1;
++      }
++
++      const std::string units = options.GetOrDefault<std::string>("units", "all");
++      if (units == "all") compute_units_ = MLComputeUnitsAll;
++      else if (units == "ne") compute_units_ = MLComputeUnitsCPUAndNeuralEngine;
++      else if (units == "gpu") compute_units_ = MLComputeUnitsCPUAndGPU;
++      else if (units == "cpu") compute_units_ = MLComputeUnitsCPUOnly;
++      else throw Exception("coreml: units must be all, ne, gpu or cpu");
++
++      forced_batch_ = options.GetOrDefault<int>("batch", 0);
++      if (forced_batch_ > 0 &&
++          std::find(batch_sizes_.begin(), batch_sizes_.end(), forced_batch_) == batch_sizes_.end()) {
++        std::string list;
++        for (int b : batch_sizes_) list += (list.empty() ? "" : ", ") + std::to_string(b);
++        throw Exception("coreml: batch=" + std::to_string(forced_batch_) +
++                        " is not in this model (has " + list + ")");
++      }
++
++      CERR << "Core ML model: " << [meta[@"name"] UTF8String] << ", units " << units
++           << ", batch sizes " << batch_sizes_.front() << ".." << batch_sizes_.back()
++           << (forced_batch_ > 0 ? ", fixed batch " + std::to_string(forced_batch_) : "");
++      // Load (and let Core ML prepare) the first function now, so its cost
++      // isn't counted in the first timed batch.
++      Model(forced_batch_ > 0 ? forced_batch_ : batch_sizes_.back());
++    }
++  }
++
++  const NetworkCapabilities& GetCapabilities() const override { return capabilities_; }
++
++  std::unique_ptr<NetworkComputation> NewComputation() override {
++    return std::make_unique<CoreMLComputation>(this);
++  }
++
++  int GetMiniBatchSize() const override {
++    return forced_batch_ > 0 ? forced_batch_ : std::min(batch_sizes_.back(), 256);
++  }
++
++  // Splits `n` positions into model calls: the smallest batch size that fits
++  // the rest, else the largest and repeat.
++  std::vector<int> Plan(int n) const {
++    std::vector<int> calls;
++    while (n > 0) {
++      int size = forced_batch_;
++      if (size == 0) {
++        auto it = std::lower_bound(batch_sizes_.begin(), batch_sizes_.end(), n);
++        size = it == batch_sizes_.end() ? batch_sizes_.back() : *it;
++      }
++      calls.push_back(size);
++      n -= size;
++    }
++    return calls;
++  }
++
++  void Compute(CoreMLComputation* c) {
++    const int n = static_cast<int>(c->inputs_.size());
++    c->policy_.assign(n * kNumOutputPolicy, 0.0f);
++    if (wdl_name_) c->wdl_.assign(n * 3, 0.0f); else c->value_.assign(n, 0.0f);
++    if (mlh_name_) c->mlh_.assign(n, 0.0f);
++
++    std::lock_guard<std::mutex> lock(mutex_);
++    int start = 0;
++    for (int size : Plan(n)) {
++      const int count = std::min(size, n - start);
++      @autoreleasepool {
++        RunBatch(c, start, count, size);
++      }
++      start += count;
++    }
++  }
++
++ private:
++  MLModel* Model(int batch) {
++    auto it = models_.find(batch);
++    if (it != models_.end()) return it->second;
++    if (@available(iOS 18.0, macOS 15.0, *)) {
++      MLModelConfiguration* config = [[MLModelConfiguration alloc] init];
++      config.computeUnits = compute_units_;
++      config.functionName = [NSString stringWithFormat:@"b%d", batch];
++      NSError* error = nil;
++      MLModel* model = [MLModel modelWithContentsOfURL:model_url_ configuration:config error:&error];
++      if (!model) {
++        throw Exception("coreml: can't load batch " + std::to_string(batch) + ": " +
++                        std::string(error.localizedDescription.UTF8String));
++      }
++      models_[batch] = model;
++      return model;
++    }
++    throw Exception("coreml: needs iOS 18 / macOS 15");
++  }
++
++  void RunBatch(CoreMLComputation* c, int start, int count, int size) {
++    // Expand the bit-packed planes to [size, 112, 8, 8] floats; padding stays 0.
++    std::vector<float> input(static_cast<size_t>(size) * kInputPlanes * 64, 0.0f);
++    for (int i = 0; i < count; i++) {
++      const InputPlanes& planes = c->inputs_[start + i];
++      float* dst = input.data() + static_cast<size_t>(i) * kInputPlanes * 64;
++      for (int p = 0; p < kInputPlanes; p++) {
++        uint64_t mask = planes[p].mask;
++        while (mask) {
++          const int sq = __builtin_ctzll(mask);
++          dst[p * 64 + sq] = planes[p].value;
++          mask &= mask - 1;
++        }
++      }
++    }
++
++    NSError* error = nil;
++    MLMultiArray* array = [[MLMultiArray alloc]
++        initWithDataPointer:input.data()
++                      shape:@[@(size), @(kInputPlanes), @8, @8]
++                   dataType:MLMultiArrayDataTypeFloat32
++                    strides:@[@(kInputPlanes * 64), @64, @8, @1]
++                deallocator:nil
++                      error:&error];
++    if (!array) throw Exception("coreml: can't wrap input");
++    MLDictionaryFeatureProvider* features = [[MLDictionaryFeatureProvider alloc]
++        initWithDictionary:@{input_name_ : [MLFeatureValue featureValueWithMultiArray:array]}
++                     error:&error];
++    id<MLFeatureProvider> result = [Model(size) predictionFromFeatures:features error:&error];
++    if (!result) {
++      throw Exception("coreml: prediction failed: " +
++                      std::string(error.localizedDescription.UTF8String));
++    }
++
++    Copy(result, policy_name_, count, kNumOutputPolicy, c->policy_.data() + start * kNumOutputPolicy);
++    if (wdl_name_) Copy(result, wdl_name_, count, 3, c->wdl_.data() + start * 3);
++    else Copy(result, value_name_, count, 1, c->value_.data() + start);
++    if (mlh_name_) Copy(result, mlh_name_, count, 1, c->mlh_.data() + start);
++  }
++
++  // Copies the first `count` rows of a [batch, width] output.
++  static void Copy(id<MLFeatureProvider> result, NSString* name, int count, int width, float* dst) {
++    MLMultiArray* out = [result featureValueForName:name].multiArrayValue;
++    if (!out) throw Exception("coreml: missing output " + std::string(name.UTF8String));
++    const NSInteger row = out.strides[0].integerValue;
++    const NSInteger col = out.strides[out.strides.count - 1].integerValue;
++    __block bool copied = false;
++    [out getBytesWithHandler:^(const void* bytes, NSInteger) {
++      for (int i = 0; i < count; i++) {
++        for (int j = 0; j < width; j++) {
++          const NSInteger idx = i * row + j * col;
++          switch (out.dataType) {
++            case MLMultiArrayDataTypeFloat32:
++              dst[i * width + j] = static_cast<const float*>(bytes)[idx];
++              break;
++            case MLMultiArrayDataTypeFloat16:
++              dst[i * width + j] = FP16toFP32(static_cast<const uint16_t*>(bytes)[idx]);
++              break;
++            case MLMultiArrayDataTypeDouble:
++              dst[i * width + j] = static_cast<float>(static_cast<const double*>(bytes)[idx]);
++              break;
++            default:
++              return;
++          }
++        }
++      }
++      copied = true;
++    }];
++    if (!copied) throw Exception("coreml: unsupported output type for " + std::string(name.UTF8String));
++  }
++
++  NSURL* model_url_;
++  NSString* input_name_;
++  NSString* policy_name_;
++  NSString* wdl_name_;
++  NSString* value_name_;
++  NSString* mlh_name_;
++  std::vector<int> batch_sizes_;
++  int forced_batch_ = 0;
++  MLComputeUnits compute_units_ = MLComputeUnitsAll;
++  NetworkCapabilities capabilities_;
++  std::map<int, MLModel*> models_;
++  std::mutex mutex_;
++};
++
++void CoreMLComputation::ComputeBlocking() { network_->Compute(this); }
++
++std::unique_ptr<Network> MakeCoreMLNetwork(const std::optional<WeightsFile>& /*weights*/,
++                                           const OptionsDict& options) {
++  return std::make_unique<CoreMLNetwork>(options);
++}
++
++}  // namespace
++
++REGISTER_NETWORK("coreml", MakeCoreMLNetwork, 58)
++
++}  // namespace coreml_backend
++}  // namespace lczero
 diff --git a/src/neural/backends/metal/mps/MetalNetworkBuilder.mm b/src/neural/backends/metal/mps/MetalNetworkBuilder.mm
 index 7791d13..ad5bcf5 100644
 --- a/src/neural/backends/metal/mps/MetalNetworkBuilder.mm

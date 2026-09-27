@@ -86,9 +86,19 @@ jobs:
 
       - name: Convert to Core ML
         run: |
+          set +e
           python3 tools/lc0_to_coreml.py --onnx work/net.onnx --net work/net.pb.gz \
             --out work/out --name "${{ steps.net.outputs.name }}" \
-            --batch-sizes "${{ steps.req.outputs.sizes }}" --precision "${{ steps.req.outputs.precision }}"
+            --batch-sizes "${{ steps.req.outputs.sizes }}" --precision "${{ steps.req.outputs.precision }}" \
+            > work/convert.log 2>&1
+          status=$?
+          cat work/convert.log
+          # Logs need a sign-in; annotations don't.
+          if [ $status -ne 0 ]; then
+            grep -E "Error|error|Exception|Traceback|File \"" work/convert.log | tail -15 \
+              | while IFS= read -r line; do echo "::error::${line:0:900}"; done
+            exit $status
+          fi
           du -sh work/out/*
 
       - name: Check against ONNX Runtime
