@@ -11,9 +11,13 @@ struct NetworksView: View {
             List {
                 Section {
                     ForEach(nets.nets, id: \.self) { url in
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(url.lastPathComponent).lineLimit(2)
-                            Text(fileSize(url)).font(.caption).foregroundStyle(.secondary)
+                        NavigationLink {
+                            NetworkDetailView(url: url)
+                        } label: {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(url.lastPathComponent).lineLimit(2)
+                                Text(fileSize(url)).font(.caption).foregroundStyle(.secondary)
+                            }
                         }
                     }
                     .onDelete { offsets in
@@ -25,17 +29,15 @@ struct NetworksView: View {
                 } header: {
                     Text("On this device")
                 } footer: {
-                    Text("You can also copy .pb.gz files into LeelaBench's folder with the Files app, or with Finder / iTunes file sharing from a computer.")
+                    Text("You can also copy .pb.gz files into LeelaBench's folder with the Files app.")
                 }
 
-                Section {
+                Section("Add a network") {
                     Button {
                         showImporter = true
                     } label: {
                         Label("Import from Files…", systemImage: "folder")
                     }
-                } header: {
-                    Text("Add a network")
                 }
 
                 Section {
@@ -50,7 +52,10 @@ struct NetworksView: View {
                     } else {
                         Button("Download") {
                             guard let url = URL(string: downloadURL.trimmingCharacters(in: .whitespaces)) else { return }
-                            Task { await nets.download(url) }
+                            Task {
+                                await nets.download(url)
+                                downloadURL = ""
+                            }
                         }
                         .disabled(URL(string: downloadURL)?.scheme?.hasPrefix("http") != true)
                     }
@@ -84,5 +89,76 @@ struct NetworksView: View {
     private func fileSize(_ url: URL) -> String {
         let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
+    }
+}
+
+/// File details plus lc0's `describenet` output.
+struct NetworkDetailView: View {
+    @EnvironmentObject private var runner: EngineRunner
+    @EnvironmentObject private var nets: NetStore
+    @Environment(\.dismiss) private var dismiss
+    let url: URL
+
+    @State private var description: String?
+    @State private var loading = false
+    @State private var confirmDelete = false
+
+    private var attributes: URLResourceValues? {
+        try? url.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey])
+    }
+
+    var body: some View {
+        List {
+            Section("File") {
+                LabeledContent("Name", value: url.lastPathComponent)
+                if let size = attributes?.fileSize {
+                    LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))
+                }
+                if let date = attributes?.contentModificationDate {
+                    LabeledContent("Added", value: date.formatted(date: .abbreviated, time: .shortened))
+                }
+            }
+
+            Section("Network info") {
+                if let description {
+                    Text(description)
+                        .font(.caption.monospaced())
+                        .textSelection(.enabled)
+                } else if loading {
+                    HStack { ProgressView(); Text("Reading network…").foregroundStyle(.secondary) }
+                } else {
+                    Button("Show architecture and training info") { describe() }
+                        .disabled(runner.isRunning)
+                    if runner.isRunning {
+                        Text("Available when the current benchmark finishes.")
+                            .font(.caption).foregroundStyle(.secondary)
+                    }
+                }
+            }
+
+            Section {
+                Button("Delete network", role: .destructive) { confirmDelete = true }
+            }
+        }
+        .navigationTitle(url.deletingPathExtension().deletingPathExtension().lastPathComponent)
+        .navigationBarTitleDisplayMode(.inline)
+        .confirmationDialog("Delete \(url.lastPathComponent)?", isPresented: $confirmDelete,
+                            titleVisibility: .visible) {
+            Button("Delete", role: .destructive) {
+                nets.delete(url)
+                dismiss()
+            }
+        }
+    }
+
+    private func describe() {
+        loading = true
+        runner.run(["describenet", "--weights=\(url.path)"]) { outcome in
+            loading = false
+            // Drop the lc0 banner and our own bookkeeping lines.
+            let lines = outcome.output.split(separator: "\n", omittingEmptySubsequences: false)
+                .drop { !$0.contains(":") }
+            description = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 }

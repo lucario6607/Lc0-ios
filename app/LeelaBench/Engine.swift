@@ -85,11 +85,28 @@ final class LogBuffer: @unchecked Sendable {
     }
 }
 
+/// Everything known about a finished lc0 invocation.
+struct RunOutcome {
+    var output: String
+    var exitCode: Int32
+    var parsed: OutputParser
+    var started: Date
+    var duration: TimeInterval
+    var thermalStart: String
+    var thermalEnd: String
+    var lowestFreeMemory: Int?
+}
+
 /// Runs lc0 in-process, one invocation at a time.
 @MainActor
 final class EngineRunner: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var log = ""
+    /// Numbers parsed from the current (or last) run's output so far.
+    @Published private(set) var parsed = OutputParser()
+    @Published private(set) var startedAt: Date?
+    /// Arguments of the current (or last) run, without argv[0].
+    @Published private(set) var arguments: [String] = []
     /// Output of a run that never finished — the app was killed mid-run.
     @Published var crashedRunLog: String?
     @Published private(set) var lowestAvailableMemory: Int?
@@ -104,7 +121,8 @@ final class EngineRunner: ObservableObject {
     private var memoryTimer: Timer?
     private var memoryWarning: NSObjectProtocol?
     private var runLog = ""
-    private var completion: ((String, Int32) -> Void)?
+    private var thermalStart = ""
+    private var completion: ((RunOutcome) -> Void)?
 
     init() {
         let buffer = self.buffer
@@ -121,13 +139,16 @@ final class EngineRunner: ObservableObject {
         "\(os_proc_available_memory() / 1_048_576) MB"
     }
 
-    /// Runs `lc0 <args...>`. `completion` gets the full output of this run and
-    /// lc0's return code.
-    func run(_ args: [String], completion: @escaping (String, Int32) -> Void) {
+    /// Runs `lc0 <args...>` and calls `completion` when lc0 returns.
+    func run(_ args: [String], completion: @escaping (RunOutcome) -> Void) {
         guard !isRunning else { return }
         isRunning = true
+        arguments = args
         log = "$ lc0 " + args.joined(separator: " ") + "\n"
         runLog = ""
+        parsed = OutputParser()
+        startedAt = Date()
+        thermalStart = DeviceInfo.thermalState
         self.completion = completion
         UIApplication.shared.isIdleTimerDisabled = true
 
@@ -190,6 +211,7 @@ final class EngineRunner: ObservableObject {
         }
 
         runLog += chunk
+        parsed.feed(chunk)
         log += chunk
         if log.count > Self.maxLogLength {
             log = "…\n" + log.suffix(Self.maxLogLength / 2)
@@ -211,8 +233,14 @@ final class EngineRunner: ObservableObject {
         isRunning = false
         UIApplication.shared.isIdleTimerDisabled = false
         log += "\n[lc0 exited with code \(code)]\n"
+        parsed.finish()
+        let started = startedAt ?? Date()
+        let outcome = RunOutcome(
+            output: runLog, exitCode: code, parsed: parsed, started: started,
+            duration: Date().timeIntervalSince(started), thermalStart: thermalStart,
+            thermalEnd: DeviceInfo.thermalState, lowestFreeMemory: lowestAvailableMemory)
         let completion = self.completion
         self.completion = nil
-        completion?(runLog, code)
+        completion?(outcome)
     }
 }

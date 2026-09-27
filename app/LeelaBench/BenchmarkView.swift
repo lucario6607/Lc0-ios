@@ -6,23 +6,48 @@ struct BenchmarkView: View {
     @EnvironmentObject private var results: ResultsStore
 
     @State private var config = BenchConfig.load()
-    @State private var lastResult: BenchResult?
+    @State private var lastResultID: UUID?
+    @State private var showDevice = false
+    @State private var showCrashLog = false
 
     private var networkPath: String? { nets.url(named: config.network)?.path }
+    private var lastResult: BenchResult? { lastResultID.flatMap { results.result(id: $0) } }
 
     var body: some View {
         NavigationStack {
             Form {
-                if let crashLog = runner.crashedRunLog { crashSection(crashLog) }
+                if runner.crashedRunLog != nil { crashSection }
+                if runner.isRunning {
+                    liveSection
+                } else if let lastResult {
+                    lastResultSection(lastResult)
+                }
                 networkSection
-                if config.mode != .describenet { backendSection }
+                backendSection
                 modeSection
                 runSection
-                if let lastResult { lastResultSection(lastResult) }
-                outputSection
-                deviceSection
             }
             .navigationTitle("LeelaBench")
+            .toolbar {
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        showDevice = true
+                    } label: {
+                        Label("Device", systemImage: DeviceInfo.isThrottling ? "thermometer.high" : "info.circle")
+                    }
+                }
+            }
+            .sheet(isPresented: $showDevice) { DeviceInfoView() }
+            .sheet(isPresented: $showCrashLog) {
+                NavigationStack {
+                    LogView(title: "Crashed run", text: runner.crashedRunLog ?? "")
+                        .toolbar {
+                            ToolbarItem(placement: .cancellationAction) {
+                                Button("Done") { showCrashLog = false }
+                            }
+                        }
+                }
+            }
             .onAppear {
                 nets.refresh()
                 if nets.url(named: config.network) == nil {
@@ -31,10 +56,93 @@ struct BenchmarkView: View {
                 if !Backend.available.contains(config.backend) { config.backend = .metal }
             }
             .onChange(of: config) { $0.save() }
+            .scrollDismissesKeyboard(.interactively)
         }
     }
 
-    // MARK: Sections
+    // MARK: Status sections
+
+    private var crashSection: some View {
+        Section {
+            Text("LeelaBench was closed while lc0 was running, usually because iOS killed it for using too much memory. The log's last lines show the free memory just before.")
+                .font(.callout)
+            Button("View log") { showCrashLog = true }
+            Button("Dismiss", role: .destructive) { runner.crashedRunLog = nil }
+        } header: {
+            Label("Previous run crashed", systemImage: "exclamationmark.octagon.fill")
+                .foregroundStyle(.red)
+        }
+    }
+
+    private var liveSection: some View {
+        Section {
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                HStack {
+                    StatTile(title: "Elapsed", value: elapsed())
+                    StatTile(title: "Free memory", value: DeviceInfo.availableMemory)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Thermal").font(.caption).foregroundStyle(.secondary)
+                        Text(DeviceInfo.thermalState).font(.title3.bold())
+                            .foregroundStyle(DeviceInfo.isThrottling ? thermalColor(DeviceInfo.thermalState) : .primary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            liveProgress
+            NavigationLink("Live output") { LiveLogView() }
+        } header: {
+            HStack(spacing: 6) {
+                ProgressView().controlSize(.small)
+                Text("Running \(config.mode.title.lowercased()) benchmark")
+            }
+        } footer: {
+            Text("Keep LeelaBench open: iOS stops GPU work in the background, and a run can't be cancelled.")
+        }
+    }
+
+    @ViewBuilder
+    private var liveProgress: some View {
+        let parsed = runner.parsed
+        if !parsed.points.isEmpty {
+            BatchNpsChart(series: [BatchSeries(name: "live", points: parsed.points)])
+                .frame(height: 200)
+                .padding(.vertical, 6)
+            if let last = parsed.points.last {
+                LabeledContent("Batch \(last.batch)", value: "\(Int(last.nps).formatted()) nps")
+                    .monospacedDigit()
+            }
+        } else if !parsed.samples.isEmpty {
+            let positions = Dictionary(grouping: parsed.samples, by: \.position)
+                .compactMap { $0.value.last }
+                .sorted { $0.position < $1.position }
+            PositionNpsChart(positions: positions)
+                .frame(height: 180)
+                .padding(.vertical, 6)
+            if let last = parsed.samples.last {
+                LabeledContent("Position \(parsed.currentPosition)/\(parsed.totalPositions ?? 0)",
+                               value: "\(last.nps.formatted()) nps")
+                    .monospacedDigit()
+            }
+        } else {
+            Text(config.backend == .onnxCoreML
+                 ? "Loading the network. Core ML compiles the model on first use, which can take a few minutes for big nets."
+                 : "Loading the network…")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func lastResultSection(_ result: BenchResult) -> some View {
+        Section("Last run") {
+            NavigationLink {
+                ResultDetailView(result: result)
+            } label: {
+                ResultRow(result: result)
+            }
+        }
+    }
+
+    // MARK: Settings sections
 
     private var networkSection: some View {
         Section("Network") {
@@ -61,19 +169,35 @@ struct BenchmarkView: View {
                     ForEach(CoreMLUnits.allCases) { Text($0.title).tag($0) }
                 }
             }
-            LabeledContent("Options") {
-                TextField(config.backend.optionsHint, text: $config.backendOpts)
-                    .multilineTextAlignment(.trailing)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .font(.body.monospaced())
+            if config.backend.isOnnx {
+                Picker("Precision", selection: $config.precision) {
+                    ForEach(Precision.allCases) { p in
+                        Text(p == .auto ? "Default (\(config.backend == .onnxCoreML ? "FP16" : "FP32"))" : p.title).tag(p)
+                    }
+                }
+            }
+            if config.backend != .random {
+                LabeledContent("Options") {
+                    TextField(config.backend.optionsHint, text: $config.backendOpts)
+                        .multilineTextAlignment(.trailing)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.body.monospaced())
+                }
             }
             Stepper("Threads: \(config.threads)", value: $config.threads, in: 1...16)
         } header: {
             Text("Backend")
         } footer: {
-            if !BuildInfo.hasOnnx {
-                Text("This build has no ONNX Runtime, so the onnx-* backends are unavailable.")
+            switch config.backend {
+            case .metal:
+                Text("Runs on the GPU in FP32 (lc0's Metal backend has no FP16 mode).")
+            case .onnxCoreML:
+                Text("Core ML decides per layer where to run within the allowed units, and always keeps the CPU as a fallback. The first run per network is slow while Core ML compiles it.")
+            case .blas, .eigen, .onnxCPU:
+                Text("Runs on the CPU. Try more threads.")
+            case .random:
+                Text("No network is evaluated; measures search overhead only.")
             }
         }
     }
@@ -95,19 +219,28 @@ struct BenchmarkView: View {
                 NumberRow(title: "Positions (max 34)", value: $config.numPositions, range: 1...34)
                 NumberRow(title: "Time per position (ms)", value: $config.movetimeMs, range: 100...600_000)
                 NumberRow(title: "Node limit (-1 = none)", value: $config.nodes, range: -1...1_000_000_000)
-            case .bench, .describenet:
+            case .bench:
                 EmptyView()
             }
 
-            LabeledContent("Extra args") {
-                TextField("--minibatch-size=64", text: $config.extraArgs)
-                    .multilineTextAlignment(.trailing)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .font(.body.monospaced())
+            DisclosureGroup("Advanced") {
+                LabeledContent("Extra args") {
+                    TextField("--minibatch-size=64", text: $config.extraArgs)
+                        .multilineTextAlignment(.trailing)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .font(.body.monospaced())
+                }
+                if let networkPath {
+                    Text("lc0 " + config.arguments(networkPath: (networkPath as NSString).lastPathComponent)
+                        .joined(separator: " "))
+                        .font(.caption.monospaced())
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
             }
         } header: {
-            Text("Mode")
+            Text("Test")
         } footer: {
             Text(config.mode.explanation)
         }
@@ -118,159 +251,48 @@ struct BenchmarkView: View {
             Button {
                 run()
             } label: {
-                HStack {
-                    Spacer()
-                    if runner.isRunning {
-                        ProgressView().padding(.trailing, 6)
-                        Text("Running…")
-                    } else {
-                        Label("Run", systemImage: "play.fill").bold()
-                    }
-                    Spacer()
-                }
+                Label(runner.isRunning ? "Running…" : "Run benchmark", systemImage: "play.fill")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity)
             }
             .disabled(runner.isRunning || networkPath == nil)
         } footer: {
-            VStack(alignment: .leading, spacing: 6) {
-                if let networkPath {
-                    Text("lc0 " + config.arguments(networkPath: (networkPath as NSString).lastPathComponent)
-                        .joined(separator: " "))
-                        .font(.caption.monospaced())
-                        .textSelection(.enabled)
-                }
-                Text("A run can't be cancelled, and iOS stops GPU work in the background, so keep the app open until it finishes.")
-            }
-        }
-    }
-
-    private func lastResultSection(_ result: BenchResult) -> some View {
-        Section("Last result") {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(result.headline).font(.title3.bold())
-                Text("\(result.backend) · \(result.network)")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            if result.points.count > 1 {
-                NpsChart(series: [result])
-                    .frame(height: 200)
-            }
-            if let lowest = runner.lowestAvailableMemory {
-                LabeledContent("Lowest free memory during run",
-                               value: ByteCountFormatter.string(fromByteCount: Int64(lowest), countStyle: .memory))
-            }
-        }
-    }
-
-    private func crashSection(_ crashLog: String) -> some View {
-        Section {
-            Text("The app was closed while lc0 was running. The last lines usually say why: if \"available memory\" drops toward 0 MB, iOS killed it for using too much memory.")
-                .font(.callout)
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(crashLog)
-                        .font(.caption2.monospaced())
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                    Color.clear.frame(height: 1).id("crashBottom")
-                }
-                .frame(height: 220)
-                .onAppear { proxy.scrollTo("crashBottom", anchor: .bottom) }
-            }
-            HStack {
-                Button("Copy log") { UIPasteboard.general.string = crashLog }
-                Spacer()
-                Button("Dismiss", role: .destructive) { runner.crashedRunLog = nil }
-            }
-            .buttonStyle(.borderless)
-        } header: {
-            Label("Previous run crashed", systemImage: "exclamationmark.octagon.fill")
-                .foregroundStyle(.red)
-        }
-    }
-
-    private var outputSection: some View {
-        Section {
-            ScrollViewReader { proxy in
-                ScrollView {
-                    Text(runner.log.isEmpty ? "Output will appear here." : runner.log)
-                        .font(.caption2.monospaced())
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .textSelection(.enabled)
-                    Color.clear.frame(height: 1).id("bottom")
-                }
-                .frame(height: 280)
-                .onChange(of: runner.log) { _ in proxy.scrollTo("bottom", anchor: .bottom) }
-            }
-        } header: {
-            HStack {
-                Text("Output")
-                Spacer()
-                Button("Copy") { UIPasteboard.general.string = runner.log }
-                    .font(.caption)
-                    .disabled(runner.log.isEmpty)
-            }
-        }
-    }
-
-    private var deviceSection: some View {
-        Section("Device") {
-            LabeledContent("Model", value: DeviceInfo.modelIdentifier)
-            LabeledContent("OS", value: DeviceInfo.osVersion)
-            LabeledContent("GPU", value: DeviceInfo.gpuName)
-            LabeledContent("CPU cores", value: "\(DeviceInfo.cpuCores)")
-            LabeledContent("RAM", value: DeviceInfo.physicalMemory)
-            LabeledContent("Available to app", value: DeviceInfo.availableMemory)
-            LabeledContent("Thermal state", value: DeviceInfo.thermalState)
             if DeviceInfo.lowPowerMode {
-                Label("Low Power Mode is on: results will be slower", systemImage: "exclamationmark.triangle")
+                Label("Low Power Mode is on, so results will be slower.", systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
+            } else if DeviceInfo.isThrottling {
+                Label("The device is hot (\(DeviceInfo.thermalState)); let it cool for comparable results.",
+                      systemImage: "thermometer.high")
                     .foregroundStyle(.orange)
             }
-            LabeledContent("lc0", value: BuildInfo.lc0Version)
         }
     }
 
     // MARK: Running
 
+    private func elapsed() -> String {
+        guard let start = runner.startedAt else { return "0:00" }
+        return Duration.seconds(Date().timeIntervalSince(start)).formatted(.time(pattern: .minuteSecond))
+    }
+
     private func run() {
         guard let path = networkPath else { return }
         let snapshot = config
         let args = snapshot.arguments(networkPath: path)
-        runner.run(args) { output, code in
-            var result = BenchResult(
-                device: DeviceInfo.summary,
-                mode: snapshot.mode,
-                network: snapshot.network,
-                backend: snapshot.mode == .describenet ? "-" : snapshot.backendLabel,
-                backendOpts: snapshot.effectiveBackendOpts,
-                threads: snapshot.threads,
-                arguments: args,
-                exitCode: code,
-                output: String(output.suffix(60_000)))
-            result.parseOutput()
-            lastResult = result
-            if snapshot.mode != .describenet {
-                results.add(result)
-            }
+        lastResultID = nil
+        runner.run(args) { outcome in
+            let result = BenchResult(config: snapshot, arguments: args, outcome: outcome)
+            results.add(result)
+            lastResultID = result.id
         }
     }
 }
 
-/// A labelled integer field.
-struct NumberRow: View {
-    let title: String
-    @Binding var value: Int
-    let range: ClosedRange<Int>
+/// The current run's output, updating as lc0 writes.
+private struct LiveLogView: View {
+    @EnvironmentObject private var runner: EngineRunner
 
     var body: some View {
-        LabeledContent(title) {
-            TextField(title, value: Binding(
-                get: { value },
-                set: { value = min(max($0, range.lowerBound), range.upperBound) }
-            ), format: .number.grouping(.never))
-            .keyboardType(.numbersAndPunctuation)
-            .multilineTextAlignment(.trailing)
-            .frame(maxWidth: 140)
-        }
+        LogView(title: "Output", text: runner.log, follow: true)
     }
 }

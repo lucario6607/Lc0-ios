@@ -1,11 +1,9 @@
 import Foundation
-import Metal
-import UIKit
 
 // MARK: - Benchmark configuration
 
 enum BenchMode: String, CaseIterable, Codable, Identifiable {
-    case backendbench, benchmark, bench, describenet
+    case backendbench, benchmark, bench
     var id: String { rawValue }
 
     var title: String {
@@ -13,18 +11,18 @@ enum BenchMode: String, CaseIterable, Codable, Identifiable {
         case .backendbench: return "Backend"
         case .benchmark: return "Search"
         case .bench: return "Quick"
-        case .describenet: return "Net info"
         }
     }
 
     var explanation: String {
         switch self {
-        case .backendbench: return "Raw NN evaluation speed per batch size (lc0 backendbench). Best for comparing backends."
-        case .benchmark: return "Full MCTS search over test positions (lc0 benchmark)."
-        case .bench: return "Short search benchmark: 10 positions × 500 ms (lc0 bench)."
-        case .describenet: return "Print the network's architecture and training info."
+        case .backendbench: return "Raw network speed at each batch size (lc0 backendbench). Best for comparing backends."
+        case .benchmark: return "Full search over test positions (lc0 benchmark)."
+        case .bench: return "Short search: 10 positions × 500 ms (lc0 bench)."
         }
     }
+
+    var isSearch: Bool { self != .backendbench }
 }
 
 enum Backend: String, CaseIterable, Codable, Identifiable {
@@ -36,20 +34,20 @@ enum Backend: String, CaseIterable, Codable, Identifiable {
 
     var title: String {
         switch self {
-        case .metal: return "Metal (GPU, MPSGraph)"
+        case .metal: return "Metal (GPU)"
         case .blas: return "BLAS (CPU, Accelerate)"
         case .eigen: return "Eigen (CPU)"
-        case .onnxCoreML: return "ONNX → Core ML"
+        case .onnxCoreML: return "Core ML (via ONNX)"
         case .onnxCPU: return "ONNX Runtime (CPU)"
-        case .random: return "Random (no NN, search only)"
+        case .random: return "Random (no network)"
         }
     }
 
     var optionsHint: String {
         switch self {
-        case .metal: return "e.g. batch=64,max_batch=1024"
-        case .blas, .eigen: return "e.g. batch_size=256"
-        case .onnxCoreML, .onnxCPU: return "e.g. batch=64,fp16=true"
+        case .metal: return "batch=64"
+        case .blas, .eigen: return "batch_size=256"
+        case .onnxCoreML, .onnxCPU: return "batch=64"
         case .random: return ""
         }
     }
@@ -72,6 +70,26 @@ enum CoreMLUnits: Int, CaseIterable, Codable, Identifiable {
         case .all: return "All"
         }
     }
+    var shortTitle: String {
+        switch self {
+        case .cpuAndGPU: return "GPU"
+        case .cpuAndNeuralEngine: return "ANE"
+        case .all: return "all"
+        }
+    }
+}
+
+/// ONNX model precision. lc0 defaults to fp16 for Core ML and fp32 for CPU.
+enum Precision: String, CaseIterable, Codable, Identifiable {
+    case auto, fp16, fp32
+    var id: String { rawValue }
+    var title: String {
+        switch self {
+        case .auto: return "Default"
+        case .fp16: return "FP16"
+        case .fp32: return "FP32"
+        }
+    }
 }
 
 struct BenchConfig: Codable, Equatable {
@@ -79,6 +97,7 @@ struct BenchConfig: Codable, Equatable {
     var backend = Backend.metal
     var backendOpts = ""
     var coreMLUnits = CoreMLUnits.cpuAndNeuralEngine
+    var precision = Precision.auto
     var mode = BenchMode.backendbench
     var threads = 1
 
@@ -95,26 +114,41 @@ struct BenchConfig: Codable, Equatable {
 
     var extraArgs = ""
 
+    var effectivePrecision: String {
+        switch precision {
+        case .fp16: return "fp16"
+        case .fp32: return "fp32"
+        case .auto:
+            switch backend {
+            case .onnxCoreML: return "fp16"
+            case .random: return "-"
+            default: return "fp32"
+            }
+        }
+    }
+
     var effectiveBackendOpts: String {
         var parts: [String] = []
         if backend == .onnxCoreML { parts.append("gpu=\(coreMLUnits.rawValue)") }
+        if backend.isOnnx && precision != .auto { parts.append("fp16=\(precision == .fp16)") }
         let trimmed = backendOpts.trimmingCharacters(in: .whitespaces)
         if !trimmed.isEmpty { parts.append(trimmed) }
         return parts.joined(separator: ",")
     }
 
     var backendLabel: String {
-        backend == .onnxCoreML ? "\(backend.rawValue) (\(coreMLUnits.title))" : backend.rawValue
+        switch backend {
+        case .onnxCoreML: return "coreml-\(coreMLUnits.shortTitle) \(effectivePrecision)"
+        case .onnxCPU: return "onnx-cpu \(effectivePrecision)"
+        default: return backend.rawValue
+        }
     }
 
     func arguments(networkPath: String) -> [String] {
-        var args = [mode.rawValue, "--weights=\(networkPath)"]
-        if mode != .describenet {
-            args.append("--backend=\(backend.rawValue)")
-            let opts = effectiveBackendOpts
-            if !opts.isEmpty { args.append("--backend-opts=\(opts)") }
-            args.append("--threads=\(threads)")
-        }
+        var args = [mode.rawValue, "--weights=\(networkPath)", "--backend=\(backend.rawValue)"]
+        let opts = effectiveBackendOpts
+        if !opts.isEmpty { args.append("--backend-opts=\(opts)") }
+        args.append("--threads=\(threads)")
         switch mode {
         case .backendbench:
             args += ["--batches=\(batches)", "--start-batch-size=\(startBatch)",
@@ -122,7 +156,7 @@ struct BenchConfig: Codable, Equatable {
         case .benchmark:
             args += ["--num-positions=\(numPositions)", "--movetime=\(movetimeMs)"]
             if nodes > 0 { args.append("--nodes=\(nodes)") }
-        case .bench, .describenet:
+        case .bench:
             break
         }
         args += extraArgs.split(whereSeparator: \.isWhitespace).map(String.init)
@@ -145,12 +179,80 @@ struct BenchConfig: Codable, Equatable {
     }
 }
 
-// MARK: - Results
+// MARK: - Parsed output
 
+/// One row of `lc0 backendbench`.
 struct BatchPoint: Codable, Hashable {
     var batch: Int
     var nps: Double
+    var meanMs: Double?
 }
+
+/// One progress line of `lc0 benchmark`.
+struct SearchSample: Codable, Hashable {
+    var position: Int
+    var timeMs: Int
+    var nodes: Int
+    var nps: Int
+}
+
+/// Reads lc0's console output incrementally, line by line.
+struct OutputParser {
+    private(set) var points: [BatchPoint] = []
+    private(set) var samples: [SearchSample] = []
+    private(set) var searchNps: Int?
+    private(set) var currentPosition = 0
+    private(set) var totalPositions: Int?
+    private var partialLine = ""
+
+    mutating func feed(_ chunk: String) {
+        var lines = (partialLine + chunk).components(separatedBy: "\n")
+        partialLine = lines.removeLast()
+        lines.forEach { parse($0) }
+    }
+
+    mutating func finish() {
+        parse(partialLine)
+        partialLine = ""
+    }
+
+    private mutating func parse(_ raw: String) {
+        let line = raw.trimmingCharacters(in: .whitespaces)
+        guard !line.isEmpty else { return }
+
+        // backendbench: "  64,     1234,   51.87, ..."
+        let cols = line.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
+        if cols.count >= 5, let batch = Int(cols[0]), let nps = Double(cols[1]) {
+            points.append(BatchPoint(batch: batch, nps: nps, meanMs: Double(cols[2])))
+            return
+        }
+        // benchmark: "Position: 3/10 <fen>"
+        if line.hasPrefix("Position:") {
+            let fraction = line.dropFirst("Position:".count).split(separator: " ").first ?? ""
+            let parts = fraction.split(separator: "/").compactMap { Int($0) }
+            if parts.count == 2 {
+                currentPosition = parts[0]
+                totalPositions = parts[1]
+            }
+            return
+        }
+        // benchmark: "Benchmark time 123 ms, 4567 nodes, 890 nps, move e2e4"
+        if line.hasPrefix("Benchmark time") {
+            let numbers = line.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+            if numbers.count >= 3 {
+                samples.append(SearchSample(position: max(currentPosition, 1), timeMs: numbers[0],
+                                            nodes: numbers[1], nps: numbers[2]))
+            }
+            return
+        }
+        // benchmark summary: "Nodes/second    : 1234"
+        if line.hasPrefix("Nodes/second"), let value = line.split(separator: ":").last {
+            searchNps = Int(value.trimmingCharacters(in: .whitespaces))
+        }
+    }
+}
+
+// MARK: - Results
 
 struct BenchResult: Codable, Identifiable {
     var id = UUID()
@@ -163,258 +265,71 @@ struct BenchResult: Codable, Identifiable {
     var threads: Int
     var arguments: [String]
     var exitCode: Int32
-    var points: [BatchPoint] = []
+    var points: [BatchPoint]
     var searchNps: Int?
     var output: String
+    // Added later; optional so older saved results still load.
+    var samples: [SearchSample]?
+    var durationSeconds: Double?
+    var thermalStart: String?
+    var thermalEnd: String?
+    var lowestFreeMemory: Int?
 
     var peak: BatchPoint? { points.max { $0.nps < $1.nps } }
 
+    /// The final progress sample of each searched position.
+    var positionResults: [SearchSample] {
+        var last: [Int: SearchSample] = [:]
+        for sample in samples ?? [] { last[sample.position] = sample }
+        return last.values.sorted { $0.position < $1.position }
+    }
+
+    var succeeded: Bool { exitCode == 0 && (!points.isEmpty || searchNps != nil) }
+
+    var headlineValue: String {
+        if let searchNps { return searchNps.formatted() }
+        if let peak { return Int(peak.nps).formatted() }
+        return "—"
+    }
+
     var headline: String {
         if let searchNps { return "\(searchNps.formatted()) nps" }
-        if let peak { return "peak \(Int(peak.nps).formatted()) nps @ batch \(peak.batch)" }
-        return exitCode == 0 ? "done" : "failed (exit \(exitCode))"
+        if let peak { return "\(Int(peak.nps).formatted()) nps peak @ batch \(peak.batch)" }
+        return exitCode == 0 ? "No results" : "Failed (exit \(exitCode))"
     }
 
-    var label: String { "\(backend) · \(network)" }
+    var networkShortName: String {
+        network.replacingOccurrences(of: ".pb.gz", with: "").replacingOccurrences(of: ".pb", with: "")
+    }
 
-    /// Pulls numbers out of lc0's console output.
-    mutating func parseOutput() {
-        for line in output.split(separator: "\n") {
-            // backendbench rows: "  64,     1234,  51.87, ..."
-            let cols = line.split(separator: ",").map { $0.trimmingCharacters(in: .whitespaces) }
-            if cols.count >= 5, let batch = Int(cols[0]), let nps = Double(cols[1]) {
-                points.append(BatchPoint(batch: batch, nps: nps))
-            }
-            // benchmark summary: "Nodes/second    : 1234"
-            if line.hasPrefix("Nodes/second"), let value = line.split(separator: ":").last {
-                searchNps = Int(value.trimmingCharacters(in: .whitespaces))
-            }
-        }
+    var label: String { "\(backend) · \(networkShortName)" }
+
+    /// The values plotted for this result, whichever kind of run it was.
+    var sparkline: [Double] {
+        if !points.isEmpty { return points.map(\.nps) }
+        return positionResults.map { Double($0.nps) }
     }
 }
 
-@MainActor
-final class ResultsStore: ObservableObject {
-    @Published private(set) var results: [BenchResult] = []
-
-    private let url = FileLocations.documents.appendingPathComponent("results.json")
-
-    init() {
-        if let data = try? Data(contentsOf: url),
-           let decoded = try? JSONDecoder().decode([BenchResult].self, from: data) {
-            results = decoded
-        }
+extension BenchResult {
+    init(config: BenchConfig, arguments: [String], outcome: RunOutcome) {
+        self.init(
+            date: outcome.started,
+            device: DeviceInfo.summary,
+            mode: config.mode,
+            network: config.network,
+            backend: config.backendLabel,
+            backendOpts: config.effectiveBackendOpts,
+            threads: config.threads,
+            arguments: arguments,
+            exitCode: outcome.exitCode,
+            points: outcome.parsed.points,
+            searchNps: outcome.parsed.searchNps,
+            output: String(outcome.output.suffix(60_000)),
+            samples: outcome.parsed.samples.isEmpty ? nil : outcome.parsed.samples,
+            durationSeconds: outcome.duration,
+            thermalStart: outcome.thermalStart,
+            thermalEnd: outcome.thermalEnd,
+            lowestFreeMemory: outcome.lowestFreeMemory)
     }
-
-    func add(_ result: BenchResult) {
-        results.insert(result, at: 0)
-        save()
-    }
-
-    func delete(ids: Set<UUID>) {
-        results.removeAll { ids.contains($0.id) }
-        save()
-    }
-
-    private func save() {
-        if let data = try? JSONEncoder().encode(results) {
-            try? data.write(to: url, options: .atomic)
-        }
-    }
-
-    /// One row per data point, for spreadsheets.
-    func exportCSV() -> URL {
-        var csv = "date,device,mode,network,backend,backend_opts,threads,batch,nps\n"
-        let formatter = ISO8601DateFormatter()
-        func q(_ s: String) -> String { "\"" + s.replacingOccurrences(of: "\"", with: "\"\"") + "\"" }
-        for r in results {
-            let prefix = [formatter.string(from: r.date), q(r.device), r.mode.rawValue, q(r.network),
-                          q(r.backend), q(r.backendOpts), String(r.threads)].joined(separator: ",")
-            if r.points.isEmpty {
-                csv += prefix + ",," + (r.searchNps.map(String.init) ?? "") + "\n"
-            } else {
-                for p in r.points { csv += prefix + ",\(p.batch),\(Int(p.nps))\n" }
-            }
-        }
-        let out = FileManager.default.temporaryDirectory.appendingPathComponent("leelabench-results.csv")
-        try? csv.write(to: out, atomically: true, encoding: .utf8)
-        return out
-    }
-}
-
-// MARK: - Networks on disk
-
-enum FileLocations {
-    static let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-    static let nets: URL = {
-        let url = documents.appendingPathComponent("nets", isDirectory: true)
-        try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
-        return url
-    }()
-}
-
-@MainActor
-final class NetStore: NSObject, ObservableObject, URLSessionDownloadDelegate {
-    @Published private(set) var nets: [URL] = []
-    @Published private(set) var downloadProgress: Double?
-    @Published var lastError: String?
-
-    private var downloadContinuation: CheckedContinuation<URL, Error>?
-
-    override init() {
-        super.init()
-        refresh()
-    }
-
-    /// Nets live in Documents/nets; files dropped into Documents via the Files
-    /// app or Finder are picked up too.
-    func refresh() {
-        let fm = FileManager.default
-        var found: [URL] = []
-        for dir in [FileLocations.nets, FileLocations.documents] {
-            let items = (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: [.isDirectoryKey])) ?? []
-            for url in items {
-                let isDir = (try? url.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
-                if !isDir && !["results.json", "last-run.log"].contains(url.lastPathComponent)
-                    && !url.lastPathComponent.hasPrefix(".") {
-                    found.append(url)
-                }
-            }
-        }
-        nets = found.sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
-    }
-
-    func url(named name: String) -> URL? {
-        nets.first { $0.lastPathComponent == name }
-    }
-
-    func importFile(_ source: URL) {
-        let scoped = source.startAccessingSecurityScopedResource()
-        defer { if scoped { source.stopAccessingSecurityScopedResource() } }
-        let dest = FileLocations.nets.appendingPathComponent(source.lastPathComponent)
-        do {
-            try? FileManager.default.removeItem(at: dest)
-            try FileManager.default.copyItem(at: source, to: dest)
-        } catch {
-            lastError = "Import failed: \(error.localizedDescription)"
-        }
-        refresh()
-    }
-
-    func delete(_ url: URL) {
-        try? FileManager.default.removeItem(at: url)
-        refresh()
-    }
-
-    func download(_ remote: URL) async {
-        guard downloadProgress == nil else { return }
-        downloadProgress = 0
-        defer { downloadProgress = nil }
-        do {
-            let session = URLSession(configuration: .default, delegate: self, delegateQueue: .main)
-            let tempURL: URL = try await withCheckedThrowingContinuation { continuation in
-                downloadContinuation = continuation
-                session.downloadTask(with: remote).resume()
-            }
-            session.finishTasksAndInvalidate()
-            var name = remote.lastPathComponent
-            if name.isEmpty || !name.contains(".") { name += ".pb.gz" }
-            let dest = FileLocations.nets.appendingPathComponent(name)
-            try? FileManager.default.removeItem(at: dest)
-            try FileManager.default.moveItem(at: tempURL, to: dest)
-        } catch {
-            lastError = "Download failed: \(error.localizedDescription)"
-        }
-        refresh()
-    }
-
-    // URLSessionDownloadDelegate — delegateQueue is .main.
-
-    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                                didWriteData _: Int64, totalBytesWritten written: Int64,
-                                totalBytesExpectedToWrite expected: Int64) {
-        Task { @MainActor in
-            self.downloadProgress = expected > 0 ? Double(written) / Double(expected) : 0
-        }
-    }
-
-    nonisolated func urlSession(_ session: URLSession, downloadTask: URLSessionDownloadTask,
-                                didFinishDownloadingTo location: URL) {
-        // The file is deleted when this returns, so move it somewhere stable first.
-        let keep = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
-        let status = (downloadTask.response as? HTTPURLResponse)?.statusCode ?? 200
-        let result: Result<URL, Error>
-        if !(200..<300).contains(status) {
-            result = .failure(URLError(.badServerResponse, userInfo: [NSLocalizedDescriptionKey: "HTTP \(status)"]))
-        } else {
-            do {
-                try FileManager.default.moveItem(at: location, to: keep)
-                result = .success(keep)
-            } catch {
-                result = .failure(error)
-            }
-        }
-        Task { @MainActor in
-            self.downloadContinuation?.resume(with: result)
-            self.downloadContinuation = nil
-        }
-    }
-
-    nonisolated func urlSession(_ session: URLSession, task: URLSessionTask,
-                                didCompleteWithError error: Error?) {
-        guard let error else { return }
-        Task { @MainActor in
-            self.downloadContinuation?.resume(throwing: error)
-            self.downloadContinuation = nil
-        }
-    }
-}
-
-// MARK: - Device / build info
-
-enum BuildInfo {
-    static var lc0Version: String {
-        Bundle.main.object(forInfoDictionaryKey: "LC0Version") as? String ?? "unknown"
-    }
-    static var hasOnnx: Bool {
-        (Bundle.main.object(forInfoDictionaryKey: "LC0Onnx") as? String) == "true"
-    }
-}
-
-enum DeviceInfo {
-    static let modelIdentifier: String = {
-        var info = utsname()
-        uname(&info)
-        return withUnsafeBytes(of: &info.machine) { raw in
-            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
-        }
-    }()
-
-    static let gpuName = MTLCreateSystemDefaultDevice()?.name ?? "unknown"
-
-    static var osVersion: String { "iOS \(UIDevice.current.systemVersion)" }
-
-    static var summary: String { "\(modelIdentifier), \(osVersion)" }
-
-    static var physicalMemory: String {
-        ByteCountFormatter.string(fromByteCount: Int64(ProcessInfo.processInfo.physicalMemory), countStyle: .memory)
-    }
-
-    static var availableMemory: String {
-        ByteCountFormatter.string(fromByteCount: Int64(os_proc_available_memory()), countStyle: .memory)
-    }
-
-    static var cpuCores: Int { ProcessInfo.processInfo.activeProcessorCount }
-
-    static var thermalState: String {
-        switch ProcessInfo.processInfo.thermalState {
-        case .nominal: return "nominal"
-        case .fair: return "fair"
-        case .serious: return "serious (throttling)"
-        case .critical: return "critical (throttling)"
-        @unknown default: return "unknown"
-        }
-    }
-
-    static var lowPowerMode: Bool { ProcessInfo.processInfo.isLowPowerModeEnabled }
 }
