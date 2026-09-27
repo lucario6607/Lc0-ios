@@ -49,9 +49,8 @@ struct BenchmarkView: View {
                 if runner.crashedRunLog != nil { crashSection }
                 if isBusy {
                     liveSection
-                } else {
-                    Section { IdleStatusRow() }
-                    if let lastResult { lastResultSection(lastResult) }
+                } else if let lastResult {
+                    lastResultSection(lastResult)
                 }
                 networkSection
                 backendSection
@@ -112,13 +111,22 @@ struct BenchmarkView: View {
 
     private var liveSection: some View {
         Section {
-            RunStatsBar(started: sweep?.started)
-            MemoryChart()
-                .frame(height: 60)
+            TimelineView(.periodic(from: .now, by: 1)) { _ in
+                HStack {
+                    StatTile(title: "Elapsed", value: elapsed())
+                    StatTile(title: "Free memory", value: DeviceInfo.availableMemory)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Thermal").font(.caption).foregroundStyle(.secondary)
+                        Text(DeviceInfo.thermalState).font(.title3.bold())
+                            .foregroundStyle(DeviceInfo.isThrottling ? thermalColor(DeviceInfo.thermalState) : .primary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
             liveProgress
-            LogTail()
-                .frame(height: 240)
-            NavigationLink("Full-screen output") { LiveLogView(started: sweep?.started) }
+            LiveLogTail()
+                .frame(height: 260)
+            NavigationLink("Full-screen output") { LiveLogView() }
         } header: {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
@@ -350,6 +358,11 @@ struct BenchmarkView: View {
 
     // MARK: Running
 
+    private func elapsed() -> String {
+        guard let start = sweep?.started ?? runner.startedAt else { return "0:00" }
+        return Duration.seconds(Date().timeIntervalSince(start)).formatted(.time(pattern: .minuteSecond))
+    }
+
     private func run() {
         guard let path = networkPath else { return }
         let snapshot = config
@@ -417,21 +430,30 @@ struct BenchmarkView: View {
     }
 }
 
-/// The current run's output, updating as lc0 writes, with the run stats pinned on top.
+/// The end of the current run's output, inline and kept scrolled to the bottom.
+private struct LiveLogTail: View {
+    @EnvironmentObject private var runner: EngineRunner
+
+    var body: some View {
+        ScrollViewReader { proxy in
+            ScrollView {
+                Text(String(runner.log.suffix(8_000)))
+                    .font(.caption2.monospaced())
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .textSelection(.enabled)
+                Color.clear.frame(height: 1).id("tail")
+            }
+            .onAppear { proxy.scrollTo("tail", anchor: .bottom) }
+            .onChange(of: runner.log) { _ in proxy.scrollTo("tail", anchor: .bottom) }
+        }
+    }
+}
+
+/// The current run's output, updating as lc0 writes.
 private struct LiveLogView: View {
     @EnvironmentObject private var runner: EngineRunner
-    var started: Date?
 
     var body: some View {
         LogView(title: "Output", text: runner.log, follow: true)
-            .safeAreaInset(edge: .top, spacing: 0) {
-                VStack(spacing: 6) {
-                    RunStatsBar(started: started)
-                    MemoryChart().frame(height: 44)
-                }
-                .padding(.horizontal)
-                .padding(.vertical, 8)
-                .background(.bar)
-            }
     }
 }
