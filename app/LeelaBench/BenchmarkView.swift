@@ -9,6 +9,26 @@ struct BenchmarkView: View {
     @State private var lastResultID: UUID?
     @State private var showDevice = false
     @State private var showCrashLog = false
+    @State private var sweep: SweepState?
+
+    /// A batch-size sweep in progress: one lc0 run per size.
+    private struct SweepState {
+        var config: BenchConfig
+        var networkPath: String
+        var sizes: [Int]
+        var index = 0
+        var resultID = UUID()
+        var points: [BatchPoint] = []
+        var failed: [Int] = []
+        var output = ""
+        var started = Date()
+        var thermalStart = DeviceInfo.thermalState
+        var lowestFreeMemory: Int?
+
+        var currentSize: Int? { index < sizes.count ? sizes[index] : nil }
+    }
+
+    private var isBusy: Bool { runner.isRunning || sweep != nil }
 
     private var networkPath: String? { nets.url(named: config.network)?.path }
 
@@ -27,7 +47,7 @@ struct BenchmarkView: View {
         NavigationStack {
             Form {
                 if runner.crashedRunLog != nil { crashSection }
-                if runner.isRunning {
+                if isBusy {
                     liveSection
                 } else if let lastResult {
                     lastResultSection(lastResult)
@@ -65,7 +85,12 @@ struct BenchmarkView: View {
                 }
                 if !Backend.available.contains(config.backend) { config.backend = .metal }
             }
-            .onChange(of: config) { $0.save() }
+            .onChange(of: config) { newConfig in
+                if newConfig.mode == .sweep && !newConfig.backend.isOnnx {
+                    config.mode = .backendbench
+                }
+                newConfig.save()
+            }
             .scrollDismissesKeyboard(.interactively)
         }
     }
@@ -103,7 +128,11 @@ struct BenchmarkView: View {
         } header: {
             HStack(spacing: 6) {
                 ProgressView().controlSize(.small)
-                Text("Running \(config.mode.title.lowercased()) benchmark")
+                if let sweep, let size = sweep.currentSize {
+                    Text("Sweep: batch \(size) (\(sweep.index + 1) of \(sweep.sizes.count))")
+                } else {
+                    Text("Running \(config.mode.title.lowercased()) benchmark")
+                }
             }
         } footer: {
             Text("Keep LeelaBench open: iOS stops GPU work in the background, and a run can't be cancelled.")
@@ -113,7 +142,24 @@ struct BenchmarkView: View {
     @ViewBuilder
     private var liveProgress: some View {
         let parsed = runner.parsed
-        if !parsed.points.isEmpty {
+        if let sweep {
+            if sweep.points.isEmpty {
+                Text("Compiling and measuring batch \(sweep.currentSize ?? 0). Core ML compiles the model for every size, which can take a few minutes for big nets.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                BatchNpsChart(series: [BatchSeries(name: "sweep", points: sweep.points)])
+                    .frame(height: 200)
+                    .padding(.vertical, 6)
+                LabeledContent("Measuring batch \(sweep.currentSize ?? 0)",
+                               value: parsed.points.isEmpty ? "compiling…" : "measuring…")
+            }
+            if !sweep.failed.isEmpty {
+                Text("Failed: batch \(sweep.failed.map(String.init).joined(separator: ", "))")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+        } else if !parsed.points.isEmpty {
             BatchNpsChart(series: [BatchSeries(name: "live", points: parsed.points)])
                 .frame(height: 200)
                 .padding(.vertical, 6)
@@ -185,14 +231,16 @@ struct BenchmarkView: View {
                         Text(p == .auto ? "Default (\(config.backend == .onnxCoreML ? "FP16" : "FP32"))" : p.title).tag(p)
                     }
                 }
-                Picker("Sessions", selection: $config.onnxSessions) {
-                    Text("Default (\(config.backend == .onnxCoreML ? 4 : 1))").tag(0)
-                    Text("1 (least memory)").tag(1)
-                    Text("2").tag(2)
-                    Text("4").tag(4)
+                if config.mode != .sweep {
+                    Picker("Sessions", selection: $config.onnxSessions) {
+                        Text("Default (\(config.backend == .onnxCoreML ? 4 : 1))").tag(0)
+                        Text("1 (least memory)").tag(1)
+                        Text("2").tag(2)
+                        Text("4").tag(4)
+                    }
+                    NumberRow(title: "Session batch (0 = default)", value: $config.onnxBatch, range: 0...1024)
                 }
-                NumberRow(title: "Session batch (0 = default)", value: $config.onnxBatch, range: 0...1024)
-                if bigNetWarning {
+                if bigNetWarning && config.mode != .sweep {
                     Label("Big network: each session keeps its own copy of the model, and iOS limits the app to about \(DeviceInfo.availableMemory). Set Sessions to 1 (with a session batch of 64 or so).",
                           systemImage: "memorychip")
                         .font(.callout)
@@ -228,11 +276,24 @@ struct BenchmarkView: View {
     private var modeSection: some View {
         Section {
             Picker("Mode", selection: $config.mode) {
-                ForEach(BenchMode.allCases) { Text($0.title).tag($0) }
+                ForEach(BenchMode.allCases.filter { $0 != .sweep || config.backend.isOnnx }) {
+                    Text($0.title).tag($0)
+                }
             }
             .pickerStyle(.segmented)
 
             switch config.mode {
+            case .sweep:
+                LabeledContent("Batch sizes") {
+                    TextField("8, 16, 32, 64", text: $config.sweepSizes)
+                        .multilineTextAlignment(.trailing)
+                        .keyboardType(.numbersAndPunctuation)
+                        .font(.body.monospaced())
+                }
+                NumberRow(title: "Batches per size", value: $config.batches, range: 2...10_000)
+                Text("Each size runs as one session of exactly that size (lc0 steps=1, batch=N) and is measured only at that size, so there's no padding. Sessions / Session batch above are ignored.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             case .backendbench:
                 NumberRow(title: "Batches per size", value: $config.batches, range: 2...10_000)
                 NumberRow(title: "Start batch size", value: $config.startBatch, range: 1...1024)
@@ -274,11 +335,13 @@ struct BenchmarkView: View {
             Button {
                 run()
             } label: {
-                Label(runner.isRunning ? "Running…" : "Run benchmark", systemImage: "play.fill")
+                Label(isBusy ? "Running…" : config.mode == .sweep ? "Run sweep" : "Run benchmark",
+                      systemImage: "play.fill")
                     .font(.headline)
                     .frame(maxWidth: .infinity)
             }
-            .disabled(runner.isRunning || networkPath == nil)
+            .disabled(isBusy || networkPath == nil
+                      || (config.mode == .sweep && config.parsedSweepSizes.isEmpty))
         } footer: {
             if DeviceInfo.lowPowerMode {
                 Label("Low Power Mode is on, so results will be slower.", systemImage: "exclamationmark.triangle")
@@ -294,20 +357,74 @@ struct BenchmarkView: View {
     // MARK: Running
 
     private func elapsed() -> String {
-        guard let start = runner.startedAt else { return "0:00" }
+        guard let start = sweep?.started ?? runner.startedAt else { return "0:00" }
         return Duration.seconds(Date().timeIntervalSince(start)).formatted(.time(pattern: .minuteSecond))
     }
 
     private func run() {
         guard let path = networkPath else { return }
         let snapshot = config
-        let args = snapshot.arguments(networkPath: path)
         lastResultID = nil
+        if snapshot.mode == .sweep {
+            sweep = SweepState(config: snapshot, networkPath: path, sizes: snapshot.parsedSweepSizes)
+            runSweepStep()
+            return
+        }
+        let args = snapshot.arguments(networkPath: path)
         runner.run(args) { outcome in
             let result = BenchResult(config: snapshot, arguments: args, outcome: outcome)
             results.add(result)
             lastResultID = result.id
         }
+    }
+
+    /// Runs the current sweep size, records it, then moves on to the next.
+    private func runSweepStep() {
+        guard let state = sweep, let size = state.currentSize else {
+            lastResultID = sweep?.resultID
+            sweep = nil
+            return
+        }
+        let args = state.config.sweepArguments(networkPath: state.networkPath, batch: size)
+        runner.run(args) { outcome in
+            guard var state = sweep else { return }
+            if let point = outcome.parsed.points.last(where: { $0.batch == size }) {
+                state.points.append(point)
+            } else {
+                state.failed.append(size)
+            }
+            state.output += "===== session batch \(size) (exit \(outcome.exitCode)) =====\n" + outcome.output + "\n"
+            state.output = String(state.output.suffix(60_000))
+            if let low = outcome.lowestFreeMemory {
+                state.lowestFreeMemory = min(state.lowestFreeMemory ?? low, low)
+            }
+            state.index += 1
+            sweep = state
+            // Save after every size, so a crash later in the sweep keeps what's done.
+            results.upsert(sweepResult(state, lastArguments: args, thermalEnd: outcome.thermalEnd))
+            runSweepStep()
+        }
+    }
+
+    private func sweepResult(_ state: SweepState, lastArguments: [String], thermalEnd: String) -> BenchResult {
+        BenchResult(
+            id: state.resultID,
+            date: state.started,
+            device: DeviceInfo.summary,
+            mode: .sweep,
+            network: state.config.network,
+            backend: state.config.backendLabel,
+            backendOpts: state.config.backendOpts(sessions: 1, batch: 0) + " (batch swept)",
+            threads: state.config.threads,
+            arguments: lastArguments,
+            exitCode: state.points.isEmpty ? 1 : 0,
+            points: state.points,
+            searchNps: nil,
+            output: state.output,
+            durationSeconds: Date().timeIntervalSince(state.started),
+            thermalStart: state.thermalStart,
+            thermalEnd: thermalEnd,
+            lowestFreeMemory: state.lowestFreeMemory)
     }
 }
 

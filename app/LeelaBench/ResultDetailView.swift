@@ -11,10 +11,16 @@ struct ResultDetailView: View {
             summarySection
 
             if !result.points.isEmpty {
-                Section("Speed by batch size") {
+                Section {
                     BatchNpsChart(series: [BatchSeries(name: result.backend, points: result.points)])
                         .frame(height: 240)
                         .padding(.vertical, 8)
+                } header: {
+                    Text(result.mode == .sweep ? "Speed by session batch size" : "Speed by batch size")
+                } footer: {
+                    if result.mode == .sweep {
+                        Text("Each point is the model compiled as one session of that batch size and measured with full batches only, so there's no padding.")
+                    }
                 }
                 if result.points.contains(where: { $0.meanMs != nil }) {
                     Section("Time per batch") {

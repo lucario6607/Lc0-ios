@@ -3,12 +3,13 @@ import Foundation
 // MARK: - Benchmark configuration
 
 enum BenchMode: String, CaseIterable, Codable, Identifiable {
-    case backendbench, benchmark, bench
+    case backendbench, sweep, benchmark, bench
     var id: String { rawValue }
 
     var title: String {
         switch self {
         case .backendbench: return "Backend"
+        case .sweep: return "Sweep"
         case .benchmark: return "Search"
         case .bench: return "Quick"
         }
@@ -17,12 +18,13 @@ enum BenchMode: String, CaseIterable, Codable, Identifiable {
     var explanation: String {
         switch self {
         case .backendbench: return "Raw network speed at each batch size (lc0 backendbench). Best for comparing backends."
+        case .sweep: return "Finds the best session batch size: for each size, compiles the model as one session of exactly that size and measures full batches only. Each size is a separate compile, so big nets take a while."
         case .benchmark: return "Full search over test positions (lc0 benchmark)."
         case .bench: return "Short search: 10 positions × 500 ms (lc0 bench)."
         }
     }
 
-    var isSearch: Bool { self != .backendbench }
+    var isSearch: Bool { self == .benchmark || self == .bench }
 }
 
 enum Backend: String, CaseIterable, Codable, Identifiable {
@@ -112,12 +114,20 @@ struct BenchConfig: Codable, Equatable {
     var maxBatch = 256
     var batchStep = 16
 
+    // sweep
+    var sweepSizes = "8, 16, 32, 64, 128, 256"
+
     // benchmark
     var numPositions = 10
     var movetimeMs = 5000
     var nodes = -1
 
     var extraArgs = ""
+
+    var parsedSweepSizes: [Int] {
+        let sizes = sweepSizes.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+        return Array(Set(sizes.filter { (1...1024).contains($0) })).sorted()
+    }
 
     var effectivePrecision: String {
         switch precision {
@@ -133,18 +143,23 @@ struct BenchConfig: Codable, Equatable {
     }
 
     var effectiveBackendOpts: String {
+        backendOpts(sessions: onnxSessions, batch: onnxBatch)
+    }
+
+    /// `sessions`/`batch` of 0 leave lc0's defaults.
+    func backendOpts(sessions: Int, batch: Int) -> String {
         var parts: [String] = []
         if backend == .onnxCoreML { parts.append("gpu=\(coreMLUnits.rawValue)") }
         if backend.isOnnx && precision != .auto { parts.append("fp16=\(precision == .fp16)") }
-        if backend.isOnnx && onnxSessions > 0 { parts.append("steps=\(onnxSessions)") }
-        if backend.isOnnx && onnxBatch > 0 { parts.append("batch=\(onnxBatch)") }
+        if backend.isOnnx && sessions > 0 { parts.append("steps=\(sessions)") }
+        if backend.isOnnx && batch > 0 { parts.append("batch=\(batch)") }
         let trimmed = backendOpts.trimmingCharacters(in: .whitespaces)
         if !trimmed.isEmpty { parts.append(trimmed) }
         return parts.joined(separator: ",")
     }
 
     var backendLabel: String {
-        let sessions = onnxSessions > 0 ? " ×\(onnxSessions)" : ""
+        let sessions = mode == .sweep ? " sweep" : onnxSessions > 0 ? " ×\(onnxSessions)" : ""
         switch backend {
         case .onnxCoreML: return "coreml-\(coreMLUnits.shortTitle) \(effectivePrecision)\(sessions)"
         case .onnxCPU: return "onnx-cpu \(effectivePrecision)\(sessions)"
@@ -152,13 +167,26 @@ struct BenchConfig: Codable, Equatable {
         }
     }
 
+    /// One sweep step: a single session of `batch`, measured at exactly `batch`.
+    func sweepArguments(networkPath: String, batch: Int) -> [String] {
+        var args = ["backendbench", "--weights=\(networkPath)", "--backend=\(backend.rawValue)",
+                    "--backend-opts=\(backendOpts(sessions: 1, batch: batch))",
+                    "--threads=\(threads)", "--batches=\(batches)",
+                    "--start-batch-size=\(batch)", "--max-batch-size=\(batch)", "--batch-step=1"]
+        args += extraArgs.split(whereSeparator: \.isWhitespace).map(String.init)
+        return args
+    }
+
     func arguments(networkPath: String) -> [String] {
+        if mode == .sweep {
+            return sweepArguments(networkPath: networkPath, batch: parsedSweepSizes.first ?? 64)
+        }
         var args = [mode.rawValue, "--weights=\(networkPath)", "--backend=\(backend.rawValue)"]
         let opts = effectiveBackendOpts
         if !opts.isEmpty { args.append("--backend-opts=\(opts)") }
         args.append("--threads=\(threads)")
         switch mode {
-        case .backendbench:
+        case .backendbench, .sweep:
             args += ["--batches=\(batches)", "--start-batch-size=\(startBatch)",
                      "--max-batch-size=\(maxBatch)", "--batch-step=\(batchStep)"]
         case .benchmark:
@@ -193,6 +221,7 @@ struct BenchConfig: Codable, Equatable {
         startBatch = value(.startBatch, d.startBatch)
         maxBatch = value(.maxBatch, d.maxBatch)
         batchStep = value(.batchStep, d.batchStep)
+        sweepSizes = value(.sweepSizes, d.sweepSizes)
         numPositions = value(.numPositions, d.numPositions)
         movetimeMs = value(.movetimeMs, d.movetimeMs)
         nodes = value(.nodes, d.nodes)

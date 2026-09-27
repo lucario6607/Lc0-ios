@@ -26,6 +26,16 @@ final class ResultsStore: ObservableObject {
         save()
     }
 
+    /// Replace the result with the same id, or add it.
+    func upsert(_ result: BenchResult) {
+        if let i = results.firstIndex(where: { $0.id == result.id }) {
+            results[i] = result
+            save()
+        } else {
+            add(result)
+        }
+    }
+
     func delete(ids: Set<UUID>) {
         results.removeAll { ids.contains($0.id) }
         save()

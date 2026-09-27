@@ -16,7 +16,7 @@ struct ResultsView: View {
     private var filtered: [BenchResult] {
         switch filter {
         case .all: return results.results
-        case .backend: return results.results.filter { $0.mode == .backendbench }
+        case .backend: return results.results.filter { !$0.mode.isSearch }
         case .search: return results.results.filter { $0.mode.isSearch }
         }
     }
