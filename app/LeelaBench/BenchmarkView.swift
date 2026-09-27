@@ -64,8 +64,8 @@ struct BenchmarkView: View {
                 } else if let lastResult {
                     lastResultSection(lastResult)
                 }
-                networkSection
                 backendSection
+                networkSection
                 modeSection
                 runSection
             }
@@ -249,6 +249,13 @@ struct BenchmarkView: View {
                     ForEach(nets.nets, id: \.lastPathComponent) { url in
                         Text(url.lastPathComponent).tag(url.lastPathComponent)
                     }
+                }
+            }
+            if !nets.coremlModels.isEmpty && Backend.available.contains(.coreml) {
+                Button {
+                    config.backend = .coreml
+                } label: {
+                    Label("Use a Core ML model instead (native backend)", systemImage: "cpu")
                 }
             }
         }
