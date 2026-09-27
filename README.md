@@ -66,8 +66,11 @@ The `.ipa` is unsigned. Sign and install it with your own Apple ID:
 3. **Results** tab: tap **Select**, pick runs, then **Compare**.
 
 Tips:
-* Big nets (BT4 class) need a lot of memory; on phones with little RAM, iOS may kill the app.
-  Small/medium nets are safer on iPhone.
+* iOS caps each app's memory (about 3.3 GB on a 12 GB iPhone 17 Pro Max). For Core ML, lc0 builds
+  4 sessions by default (batch 16/32/48/64), each with its own copy of the model. For big nets
+  (BT4 class) set **Sessions = 1** and a session batch of ~64.
+* `LeelaBench-bigmem.ipa` requests Apple's increased-memory-limit entitlement. Free Apple IDs
+  can't grant it (the limit stays the same); it only helps with a paid developer account.
 * Thermal state is shown on the Benchmark tab. Phones throttle quickly, so let the device cool
   between runs if you want comparable numbers.
 * The first `onnx-coreml` run for a net is slow because Core ML compiles the model.

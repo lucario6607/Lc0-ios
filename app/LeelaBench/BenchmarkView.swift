@@ -11,6 +11,16 @@ struct BenchmarkView: View {
     @State private var showCrashLog = false
 
     private var networkPath: String? { nets.url(named: config.network)?.path }
+
+    /// Core ML with several sessions on a large net will likely exceed the
+    /// per-app memory limit.
+    private var bigNetWarning: Bool {
+        guard config.backend == .onnxCoreML, config.onnxSessions != 1,
+              let url = nets.url(named: config.network),
+              let size = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize
+        else { return false }
+        return size > 100_000_000
+    }
     private var lastResult: BenchResult? { lastResultID.flatMap { results.result(id: $0) } }
 
     var body: some View {
@@ -174,6 +184,19 @@ struct BenchmarkView: View {
                     ForEach(Precision.allCases) { p in
                         Text(p == .auto ? "Default (\(config.backend == .onnxCoreML ? "FP16" : "FP32"))" : p.title).tag(p)
                     }
+                }
+                Picker("Sessions", selection: $config.onnxSessions) {
+                    Text("Default (\(config.backend == .onnxCoreML ? 4 : 1))").tag(0)
+                    Text("1 (least memory)").tag(1)
+                    Text("2").tag(2)
+                    Text("4").tag(4)
+                }
+                NumberRow(title: "Session batch (0 = default)", value: $config.onnxBatch, range: 0...1024)
+                if bigNetWarning {
+                    Label("Big network: each session keeps its own copy of the model, and iOS limits the app to about \(DeviceInfo.availableMemory). Set Sessions to 1 (with a session batch of 64 or so).",
+                          systemImage: "memorychip")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
                 }
             }
             if config.backend != .random {

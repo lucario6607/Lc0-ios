@@ -98,6 +98,11 @@ struct BenchConfig: Codable, Equatable {
     var backendOpts = ""
     var coreMLUnits = CoreMLUnits.cpuAndNeuralEngine
     var precision = Precision.auto
+    /// ONNX sessions (lc0 `steps`): each compiles its own copy of the model for
+    /// one batch size. 0 = lc0's default (4 for Core ML).
+    var onnxSessions = 0
+    /// Batch size of the smallest session (lc0 `batch`). 0 = lc0's default (16 for Core ML).
+    var onnxBatch = 0
     var mode = BenchMode.backendbench
     var threads = 1
 
@@ -131,15 +136,18 @@ struct BenchConfig: Codable, Equatable {
         var parts: [String] = []
         if backend == .onnxCoreML { parts.append("gpu=\(coreMLUnits.rawValue)") }
         if backend.isOnnx && precision != .auto { parts.append("fp16=\(precision == .fp16)") }
+        if backend.isOnnx && onnxSessions > 0 { parts.append("steps=\(onnxSessions)") }
+        if backend.isOnnx && onnxBatch > 0 { parts.append("batch=\(onnxBatch)") }
         let trimmed = backendOpts.trimmingCharacters(in: .whitespaces)
         if !trimmed.isEmpty { parts.append(trimmed) }
         return parts.joined(separator: ",")
     }
 
     var backendLabel: String {
+        let sessions = onnxSessions > 0 ? " ×\(onnxSessions)" : ""
         switch backend {
-        case .onnxCoreML: return "coreml-\(coreMLUnits.shortTitle) \(effectivePrecision)"
-        case .onnxCPU: return "onnx-cpu \(effectivePrecision)"
+        case .onnxCoreML: return "coreml-\(coreMLUnits.shortTitle) \(effectivePrecision)\(sessions)"
+        case .onnxCPU: return "onnx-cpu \(effectivePrecision)\(sessions)"
         default: return backend.rawValue
         }
     }
@@ -161,6 +169,34 @@ struct BenchConfig: Codable, Equatable {
         }
         args += extraArgs.split(whereSeparator: \.isWhitespace).map(String.init)
         return args
+    }
+
+    init() {}
+
+    /// Field-by-field so settings survive app updates that add new fields.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func value<T: Decodable>(_ key: CodingKeys, _ fallback: T) -> T {
+            (try? c.decodeIfPresent(T.self, forKey: key)) ?? fallback
+        }
+        let d = BenchConfig()
+        network = value(.network, d.network)
+        backend = value(.backend, d.backend)
+        backendOpts = value(.backendOpts, d.backendOpts)
+        coreMLUnits = value(.coreMLUnits, d.coreMLUnits)
+        precision = value(.precision, d.precision)
+        onnxSessions = value(.onnxSessions, d.onnxSessions)
+        onnxBatch = value(.onnxBatch, d.onnxBatch)
+        mode = value(.mode, d.mode)
+        threads = value(.threads, d.threads)
+        batches = value(.batches, d.batches)
+        startBatch = value(.startBatch, d.startBatch)
+        maxBatch = value(.maxBatch, d.maxBatch)
+        batchStep = value(.batchStep, d.batchStep)
+        numPositions = value(.numPositions, d.numPositions)
+        movetimeMs = value(.movetimeMs, d.movetimeMs)
+        nodes = value(.nodes, d.nodes)
+        extraArgs = value(.extraArgs, d.extraArgs)
     }
 
     private static let key = "BenchConfig"
