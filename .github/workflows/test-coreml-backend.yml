@@ -1,0 +1,68 @@
+name: Test Core ML backend (macOS)
+
+# Builds lc0 for macOS with the patched coreml backend and runs it on a
+# converted model, so backend bugs show up with full output instead of as a
+# crash on the phone.
+on:
+  push:
+    branches: [main]
+    paths: [patches/**, .github/workflows/test-coreml-backend.yml]
+  workflow_dispatch:
+    inputs:
+      model_url:
+        description: URL of a .lc0coreml.aar
+        required: false
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 60
+    env:
+      MODEL_URL: ${{ inputs.model_url || 'https://github.com/lucario6607/Lc0-ios/releases/download/coreml-t3-512x15x16h-distill-swa-2767500-fp16/t3-512x15x16h-distill-swa-2767500-fp16.lc0coreml.aar' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build lc0 (macOS, coreml backend)
+        run: |
+          python -m pip install meson ninja
+          git clone -q --depth 1 -b release/0.33 https://github.com/LeelaChessZero/lc0.git build/lc0-src
+          git -C build/lc0-src apply "$PWD/patches/lc0-ios.patch"
+          meson setup build/lc0 build/lc0-src --buildtype=release -Dgtest=false \
+            -Dcoreml=true -Dmetal=disabled -Dblas=false -Donnx=false -Dplain_cuda=false \
+            -Dopencl=false -Dnative_arch=false
+          ninja -C build/lc0 lc0 2>&1 | tail -20
+
+      - name: Download model
+        run: |
+          mkdir -p work && curl -fsSL -o work/model.aar "$MODEL_URL"
+          aa extract -i work/model.aar -d work/models
+          find work/models -maxdepth 2
+          echo "MODEL_DIR=$(ls -d "$PWD"/work/models/*.lc0coreml | head -1)" >> "$GITHUB_ENV"
+
+      - name: Run backendbench and bench
+        run: |
+          set +e
+          run() {
+            echo "::group::lc0 $*"
+            build/lc0/lc0 "$@" > work/out.txt 2>&1
+            status=$?
+            cat work/out.txt
+            echo "::endgroup::"
+            tail -4 work/out.txt | while IFS= read -r line; do echo "::notice title=lc0 $1 (exit $status)::${line:0:800}"; done
+            return $status
+          }
+          fail=0
+          for units in cpu all; do
+            run backendbench --weights= --backend=coreml \
+              "--backend-opts=model='$MODEL_DIR',units=$units,batch=16" \
+              --batches=5 --start-batch-size=16 --max-batch-size=16 || fail=1
+          done
+          run backendbench --weights= --backend=coreml "--backend-opts=model='$MODEL_DIR',units=cpu" \
+            --batches=3 --start-batch-size=1 --max-batch-size=40 --batch-step=13 || fail=1
+          run bench --weights= --backend=coreml "--backend-opts=model='$MODEL_DIR',units=cpu,batch=16" \
+            --minibatch-size=16 || fail=1
+          exit $fail
