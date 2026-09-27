@@ -39,7 +39,7 @@ struct NetworksView: View {
                         } label: {
                             VStack(alignment: .leading, spacing: 2) {
                                 Text(model.displayName).lineLimit(2)
-                                Text("\(model.precision.uppercased()) · batches \(model.batchSizes.map(String.init).joined(separator: ", ")) · \(ByteCountFormatter.string(fromByteCount: model.bytes, countStyle: .file))")
+                                Text("\(model.precision.uppercased()) Â· batches \(model.batchSizes.map(String.init).joined(separator: ", ")) Â· \(ByteCountFormatter.string(fromByteCount: model.bytes, countStyle: .file))")
                                     .font(.caption).foregroundStyle(.secondary)
                             }
                         }
@@ -48,7 +48,7 @@ struct NetworksView: View {
                         offsets.map { nets.coremlModels[$0].url }.forEach(nets.delete)
                     }
                     if nets.unpacking {
-                        HStack { ProgressView(); Text("Unpacking Core ML model…").foregroundStyle(.secondary) }
+                        HStack { ProgressView(); Text("Unpacking Core ML modelâ€¦").foregroundStyle(.secondary) }
                     } else if nets.coremlModels.isEmpty {
                         Text("No Core ML models yet.").foregroundStyle(.secondary)
                     }
