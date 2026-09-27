@@ -336,7 +336,7 @@ def main():
         "name": name,
         "batch_sizes": sizes,
         "precision": args.precision,
-        "input": safe(conv.input_name),
+        "input": "planes",  # the MIL program argument name
         "outputs": {o.split("/")[-1]: safe(o) for o in outputs},
         "format": fmt,
     }
