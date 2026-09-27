@@ -64,6 +64,16 @@ jobs:
             build | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E "error|warning: .*lc0|BUILD" || true
           test -d "$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app"
 
+      - name: Check backends are linked in
+        run: |
+          BIN="$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app/LeelaBench"
+          ls -lh "$BIN"
+          for backend in metal blas eigen onnx-coreml; do
+            if strings "$BIN" | grep -qx "$backend"; then echo "found $backend"
+            else echo "::error::backend '$backend' missing from app binary"; missing=1; fi
+          done
+          test -z "$missing"
+
       - name: Package .ipa
         run: |
           mkdir -p dist/Payload

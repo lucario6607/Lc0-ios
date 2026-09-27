@@ -135,7 +135,9 @@ cat "$WORK/archives.txt"
 xcrun libtool -static -no_warning_for_no_symbols -o "$VENDOR/lib/liblc0_all.a" \
   $(cat "$WORK/archives.txt")
 
-LDFLAGS="-llc0_all -lz -lc++ -framework Foundation -framework Metal"
+# -force_load: backends and search algorithms register themselves from static
+# initializers that nothing references, so a plain -l would drop them all.
+LDFLAGS="-Wl,-force_load,\$(PROJECT_DIR)/Vendor/lib/liblc0_all.a -lz -lc++ -framework Foundation -framework Metal"
 LDFLAGS="$LDFLAGS -framework MetalPerformanceShaders -framework MetalPerformanceShadersGraph"
 LDFLAGS="$LDFLAGS -framework Accelerate"
 if [ "$ONNX_BUILT" = true ]; then
