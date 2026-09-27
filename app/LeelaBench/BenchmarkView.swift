@@ -374,7 +374,7 @@ struct BenchmarkView: View {
 
             DisclosureGroup("Advanced") {
                 LabeledContent("Extra args") {
-                    TextField("--flag=value (all tests)", text: $config.extraArgs)
+                    TextField("--flag=value (Search/Quick only)", text: $config.extraArgs)
                         .multilineTextAlignment(.trailing)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()

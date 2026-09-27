@@ -211,7 +211,6 @@ struct BenchConfig: Codable, Equatable {
                     "--backend-opts=\(opts)",
                     "--threads=\(threads)", "--batches=\(batches)",
                     "--start-batch-size=\(batch)", "--max-batch-size=\(batch)", "--batch-step=1"]
-        args += extraArguments(search: false)
         return args
     }
 
@@ -238,16 +237,9 @@ struct BenchConfig: Codable, Equatable {
         }
         // Only the search tests have this flag; backendbench rejects it.
         if mode.isSearch && minibatch > 0 { args.append("--minibatch-size=\(minibatch)") }
-        args += extraArguments(search: mode.isSearch)
+        // Extra args only go to the search tests; backendbench gets exactly its own flags.
+        if mode.isSearch { args += extraArgs.split(whereSeparator: \.isWhitespace).map(String.init) }
         return args
-    }
-
-    /// Extra args, minus search-only flags on backendbench runs (they make lc0 quit).
-    func extraArguments(search: Bool) -> [String] {
-        let searchOnly = ["--minibatch-size", "--cpuct", "--max-collision"]
-        return extraArgs.split(whereSeparator: \.isWhitespace).map(String.init).filter { arg in
-            search || !searchOnly.contains { arg.hasPrefix($0) }
-        }
     }
 
     init() {}
