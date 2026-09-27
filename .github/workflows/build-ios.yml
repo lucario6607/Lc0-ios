@@ -52,7 +52,7 @@ jobs:
       - name: Build app (unsigned)
         working-directory: app
         run: |
-          set -o pipefail
+          set +e
           xcodebuild \
             -project LeelaBench.xcodeproj \
             -scheme LeelaBench \
@@ -61,8 +61,13 @@ jobs:
             -destination 'generic/platform=iOS' \
             -derivedDataPath "$RUNNER_TEMP/dd" \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
-            build | tee "$RUNNER_TEMP/xcodebuild.log" | grep -E "error|warning: .*lc0|BUILD" || true
-          test -d "$RUNNER_TEMP/dd/Build/Products/Release-iphoneos/LeelaBench.app"
+            build > "$RUNNER_TEMP/xcodebuild.log" 2>&1
+          status=$?
+          # Logs need a sign-in on GitHub; annotations don't, so surface errors there.
+          grep -E "error:|Undefined symbols|referenced from|ld: " "$RUNNER_TEMP/xcodebuild.log" \
+            | sort -u | head -40 | while IFS= read -r line; do echo "::error::${line:0:900}"; done
+          tail -5 "$RUNNER_TEMP/xcodebuild.log"
+          exit $status
 
       - name: Check backends are linked in
         run: |

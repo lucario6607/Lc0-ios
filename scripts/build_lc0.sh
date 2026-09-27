@@ -155,5 +155,5 @@ LC0_VERSION_INFO = $LC0_REF ($LC0_REV)
 LC0_ONNX = $ONNX_BUILT
 EOF
 
-echo "Built lc0 $LC0_REF ($LC0_REV), onnx=$ONNX_BUILT"
+echo "::notice::Built lc0 $LC0_REF ($LC0_REV), onnx=$ONNX_BUILT, liblc0_all.a $(stat -f%z "$VENDOR/lib/liblc0_all.a") bytes from $(wc -l < "$WORK/archives.txt") archives"
 ls -lh "$VENDOR/lib"
