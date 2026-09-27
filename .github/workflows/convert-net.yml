@@ -113,7 +113,7 @@ jobs:
           smallest="$(echo '${{ steps.req.outputs.sizes }}' | tr ',' '\n' | sort -n | head -1)"
           python tools/verify_coreml.py --onnx work/net.onnx \
             --package "work/out/${{ steps.net.outputs.name }}.mlpackage" \
-            --meta work/out/lc0coreml.json --batch-sizes "$smallest,64" 2>&1 | tee work/verify.log
+            --meta work/out/lc0coreml.json --batch-sizes "$smallest,64,256" 2>&1 | tee work/verify.log
           status=${PIPESTATUS[0]}
           if [ $status -ne 0 ]; then
             tail -3 work/verify.log | while IFS= read -r line; do echo "::error::${line:0:900}"; done

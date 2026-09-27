@@ -2,7 +2,12 @@
 """Check a converted Core ML model against ONNX Runtime (CPU, fp32).
 
 Prints one line per (batch size, compute units) and emits GitHub annotations.
-Exits non-zero if the policy disagrees badly, which means the conversion is wrong.
+
+Random inputs give flat policies with many near-ties, so a raw top-1 match
+understates fp16 accuracy. The gate uses the KL divergence of the policy
+distributions and the WDL difference; top-1 is also reported for positions
+where the reference has a clear favourite. Exits non-zero only on errors big
+enough to mean the conversion itself is wrong.
 """
 import argparse
 import json
@@ -23,6 +28,11 @@ def random_planes(batch, rng):
     x[:, 110] = 0
     x[:, 111] = 1
     return x
+
+
+def softmax(x):
+    e = np.exp(x - x.max(axis=1, keepdims=True))
+    return e / e.sum(axis=1, keepdims=True)
 
 
 def main():
@@ -55,12 +65,20 @@ def main():
                 r, c = ref[onnx_name], np.asarray(out[mil_name], dtype=np.float32).reshape(ref[onnx_name].shape)
                 diff = float(np.max(np.abs(r - c)))
                 if short == "policy":
-                    agree = float(np.mean(np.argmax(r, 1) == np.argmax(c, 1)))
-                    report.append(f"policy top1 {agree:.0%} maxdiff {diff:.3g}")
-                    if agree < 0.9:
+                    pr, pc = softmax(r), softmax(c)
+                    kl = float(np.mean(np.sum(pr * (np.log(pr + 1e-12) - np.log(pc + 1e-12)), axis=1)))
+                    top2 = np.sort(pr, axis=1)[:, -2:]
+                    clear = (top2[:, 1] - top2[:, 0]) > 0.05
+                    same = np.argmax(r, 1) == np.argmax(c, 1)
+                    clear_agree = float(np.mean(same[clear])) if clear.any() else float("nan")
+                    report.append(f"policy KL {kl:.4f}, top1 {np.mean(same):.0%} "
+                                  f"({clear_agree:.0%} of {int(clear.sum())} clear)")
+                    if kl > 0.2:
                         ok = False
                 else:
                     report.append(f"{short} maxdiff {diff:.3g}")
+                    if short == "wdl" and diff > 0.2:
+                        ok = False
             line = f"batch {b} {units}: " + ", ".join(report)
             print(line, flush=True)
             if os.environ.get("GITHUB_ACTIONS"):
