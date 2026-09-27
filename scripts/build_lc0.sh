@@ -142,7 +142,7 @@ LDFLAGS="$LDFLAGS -framework MetalPerformanceShaders -framework MetalPerformance
 LDFLAGS="$LDFLAGS -framework Accelerate"
 if [ "$ONNX_BUILT" = true ]; then
   cp "$ORT_DIR/lib/libonnxruntime.a" "$VENDOR/lib/"
-  LDFLAGS="$LDFLAGS -lonnxruntime -framework CoreML"
+  LDFLAGS="$LDFLAGS -lonnxruntime -framework CoreML -framework Network"
 else
   rm -f "$VENDOR/lib/libonnxruntime.a"
 fi
