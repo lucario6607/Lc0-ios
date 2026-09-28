@@ -1,8 +1,8 @@
 name: Convert net to Core ML
 
-# Converts an lc0 network to a Core ML model for LeelaBench's coreml backend,
-# checks it against ONNX Runtime, and publishes it as a release asset the app
-# can download by URL.
+# Converts an lc0 network to Core ML models for LeelaBench's coreml backend,
+# in one or more precisions, checks each against ONNX Runtime on real
+# positions, and publishes them as release assets the app can download by URL.
 on:
   # Also runs when convert/request.txt changes, so a conversion can be started
   # with a commit.
@@ -16,20 +16,18 @@ on:
         required: true
       batch_sizes:
         description: Batch sizes to include (one Core ML function each)
-        default: "1,8,16,32,64,128,256"
-      precision:
-        description: Compute precision
-        type: choice
-        options: [fp16, fp32]
-        default: fp16
+        default: "2,4,8,12,16,24,32,64"
+      variants:
+        description: "Precisions to build: fp16, fp32, w8 (int8 weights), w8a8 (int8 weights+activations)"
+        default: "fp16,w8"
 
 permissions:
-  contents: write  # publish the converted model as a release
+  contents: write  # publish the converted models as a release
 
 jobs:
   convert:
     runs-on: macos-15
-    timeout-minutes: 150
+    timeout-minutes: 240
     env:
       LC0_REF: release/0.33
     steps:
@@ -45,34 +43,38 @@ jobs:
           python -m pip install meson ninja coremltools onnx onnxruntime numpy
           python -c "import coremltools; from coremltools.libmilstoragepython import _BlobStorageWriter; print('coremltools', coremltools.__version__)"
 
-      - name: Cache lc0 (macOS, converter only)
+      # lc0 with the coreml backend: exports ONNX and plays a short search to
+      # collect real positions for calibration and checking.
+      - name: Cache lc0 (macOS, coreml backend)
         id: lc0cache
         uses: actions/cache@v4
         with:
           path: build/lc0-mac/lc0
-          key: lc0-mac-${{ env.LC0_REF }}-v1
+          key: lc0-mac-coreml-${{ env.LC0_REF }}-${{ hashFiles('patches/lc0-ios.patch') }}
 
       - name: Build lc0 for macOS
         if: steps.lc0cache.outputs.cache-hit != 'true'
         run: |
           git clone -q --depth 1 -b "$LC0_REF" https://github.com/LeelaChessZero/lc0.git build/lc0-src
-          meson setup build/lc0-mac build/lc0-src --buildtype=release \
-            -Dbuild_backends=false -Dgtest=false
+          git -C build/lc0-src apply "$PWD/patches/lc0-ios.patch"
+          meson setup build/lc0-mac build/lc0-src --buildtype=release -Dgtest=false \
+            -Dcoreml=true -Dmetal=disabled -Dblas=false -Donnx=false -Dplain_cuda=false \
+            -Dopencl=false -Dnative_arch=false
           ninja -C build/lc0-mac lc0
 
       - name: Read request
         id: req
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            url='${{ inputs.net_url }}'; sizes='${{ inputs.batch_sizes }}'; prec='${{ inputs.precision }}'
+            url='${{ inputs.net_url }}'; sizes='${{ inputs.batch_sizes }}'; variants='${{ inputs.variants }}'
           else
             url="$(sed -n 's/^url=//p' convert/request.txt)"
             sizes="$(sed -n 's/^batch_sizes=//p' convert/request.txt)"
-            prec="$(sed -n 's/^precision=//p' convert/request.txt)"
+            variants="$(sed -n 's/^variants=//p' convert/request.txt)"
           fi
           echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "sizes=${sizes:-1,8,16,32,64,128,256}" >> "$GITHUB_OUTPUT"
-          echo "precision=${prec:-fp16}" >> "$GITHUB_OUTPUT"
+          echo "sizes=${sizes:-2,4,8,12,16,24,32,64}" >> "$GITHUB_OUTPUT"
+          echo "variants=${variants:-fp16,w8}" >> "$GITHUB_OUTPUT"
 
       - name: Download network
         id: net
@@ -89,61 +91,64 @@ jobs:
       - name: Export to ONNX
         run: build/lc0-mac/lc0 leela2onnx --input=work/net.pb.gz --output=work/net.onnx --onnx-data-type=f32
 
-      - name: Convert to Core ML
+      - name: Convert, check and package
+        env:
+          NAME: ${{ steps.net.outputs.name }}
+          SIZES: ${{ steps.req.outputs.sizes }}
+          VARIANTS: ${{ steps.req.outputs.variants }}
         run: |
-          set +e
-          python tools/lc0_to_coreml.py --onnx work/net.onnx --net work/net.pb.gz \
-            --out work/out --name "${{ steps.net.outputs.name }}" \
-            --batch-sizes "${{ steps.req.outputs.sizes }}" --precision "${{ steps.req.outputs.precision }}" \
-            > work/convert.log 2>&1
-          status=$?
-          cat work/convert.log
+          set -uo pipefail
           # Logs need a sign-in; annotations don't.
-          if [ $status -ne 0 ]; then
-            # GitHub shows 10 annotations per step: the actual error line first.
-            { tail -3 work/convert.log; grep -E "lc0_to_coreml.py" work/convert.log | tail -3; } \
-              | while IFS= read -r line; do echo "::error::${line:0:900}"; done
-            exit $status
-          fi
-          du -sh work/out/*
+          fail() {
+            tail -3 "$1" | while IFS= read -r line; do echo "::error::${line:0:900}"; done
+            exit 1
+          }
+          convert() {  # $1 = precision
+            echo "::group::convert $1"
+            python tools/lc0_to_coreml.py --onnx work/net.onnx --net work/net.pb.gz \
+              --out "work/$1" --name "$NAME-$1" --batch-sizes "$SIZES" --precision "$1" \
+              --calibration work/positions.f32 > "work/convert-$1.log" 2>&1 || fail "work/convert-$1.log"
+            tail -5 "work/convert-$1.log"
+            echo "::endgroup::"
+            dir="work/pkg-$1/$NAME-$1.lc0coreml"
+            mkdir -p "$dir" "work/compiled-$1"
+            xcrun coremlcompiler compile "work/$1/$NAME-$1.mlpackage" "work/compiled-$1" \
+              --platform iOS --deployment-target 18.0 \
+              || xcrun coremlcompiler compile "work/$1/$NAME-$1.mlpackage" "work/compiled-$1"
+            cp -R "work/compiled-$1/$NAME-$1.mlmodelc" "$dir/model.mlmodelc"
+            cp "work/$1/lc0coreml.json" "$dir/"
+          }
 
-      - name: Check against ONNX Runtime
-        run: |
-          set +e
-          smallest="$(echo '${{ steps.req.outputs.sizes }}' | tr ',' '\n' | sort -n | head -1)"
-          python tools/verify_coreml.py --onnx work/net.onnx \
-            --package "work/out/${{ steps.net.outputs.name }}.mlpackage" \
-            --meta work/out/lc0coreml.json --batch-sizes "$smallest,64,256" 2>&1 | tee work/verify.log
-          status=${PIPESTATUS[0]}
-          if [ $status -ne 0 ]; then
-            tail -3 work/verify.log | while IFS= read -r line; do echo "::error::${line:0:900}"; done
-          fi
-          exit $status
+          # fp16 first: it plays the search that collects real positions.
+          convert fp16
+          echo "::group::collect positions"
+          build/lc0-mac/lc0 benchmark --weights= --backend=coreml \
+            "--backend-opts=model='$PWD/work/pkg-fp16/$NAME-fp16.lc0coreml',units=cpu,dump='$PWD/work/positions.f32',dump_max=1024" \
+            --num-positions=34 --nodes=40 --movetime=-1 --threads=1 > work/positions.log 2>&1 || fail work/positions.log
+          tail -5 work/positions.log
+          echo "::endgroup::"
+          python -c "import os; print('::notice title=Positions::', os.path.getsize('work/positions.f32') // (112*64*4), 'real positions collected')"
 
-      - name: Compile and package
-        id: pkg
-        run: |
-          name="${{ steps.net.outputs.name }}"
-          mkdir -p work/compiled "work/pkg/$name.lc0coreml"
-          xcrun coremlcompiler compile "work/out/$name.mlpackage" work/compiled \
-            --platform iOS --deployment-target 18.0 \
-            || xcrun coremlcompiler compile "work/out/$name.mlpackage" work/compiled
-          cp -R "work/compiled/$name.mlmodelc" "work/pkg/$name.lc0coreml/model.mlmodelc"
-          cp work/out/lc0coreml.json "work/pkg/$name.lc0coreml/"
-          asset="$name-${{ steps.req.outputs.precision }}.lc0coreml.aar"
-          aa archive -d work/pkg -o "work/$asset"
-          ls -lh "work/$asset"
-          echo "asset=work/$asset" >> "$GITHUB_OUTPUT"
-          echo "tag=coreml-$name-${{ steps.req.outputs.precision }}" >> "$GITHUB_OUTPUT"
-          echo "::notice title=Converted::$asset ($(du -h "work/$asset" | cut -f1))"
+          smallest="$(echo "$SIZES" | tr ',' '\n' | sort -n | head -1)"
+          for v in $(echo "$VARIANTS" | tr ',' ' '); do
+            [ "$v" = fp16 ] || convert "$v"
+            python tools/verify_coreml.py --onnx work/net.onnx --package "work/$v/$NAME-$v.mlpackage" \
+              --meta "work/$v/lc0coreml.json" --positions work/positions.f32 \
+              --batch-sizes "$smallest,8,64" --units CPU_ONLY > "work/verify-$v.log" 2>&1 || fail "work/verify-$v.log"
+            cat "work/verify-$v.log"
+            aa archive -d "work/pkg-$v" -o "work/$NAME-$v.lc0coreml.aar"
+            echo "::notice title=Converted $v::$NAME-$v.lc0coreml.aar ($(du -h "work/$NAME-$v.lc0coreml.aar" | cut -f1))"
+          done
+          ls -lh work/*.aar
 
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.pkg.outputs.tag }}
-          name: "Core ML: ${{ steps.net.outputs.name }} (${{ steps.req.outputs.precision }})"
+          tag_name: coreml-${{ steps.net.outputs.name }}
+          name: "Core ML: ${{ steps.net.outputs.name }}"
           body: |
             Converted from ${{ steps.req.outputs.url }}
             Batch sizes: ${{ steps.req.outputs.sizes }}
-            In LeelaBench: Networks → Download from URL → paste this asset's link.
-          files: ${{ steps.pkg.outputs.asset }}
+            Precisions: ${{ steps.req.outputs.variants }} (w8 = int8 weights, w8a8 = int8 weights and activations)
+            In LeelaBench: Networks → Download from URL → paste an asset's link.
+          files: work/*.lc0coreml.aar

@@ -102,10 +102,10 @@ index dc83a19..fff5f0c 100644
  }
 diff --git a/src/neural/backends/coreml/network_coreml.mm b/src/neural/backends/coreml/network_coreml.mm
 new file mode 100644
-index 0000000..03e46ae
+index 0000000..179efcc
 --- /dev/null
 +++ b/src/neural/backends/coreml/network_coreml.mm
-@@ -0,0 +1,306 @@
+@@ -0,0 +1,330 @@
 +/*
 +  This file is part of Leela Chess Zero.
 +  Copyright (C) 2026 The LCZero Authors
@@ -134,11 +134,15 @@ index 0000000..03e46ae
 +//   model='<dir>'   the converted model directory (required)
 +//   units=all|ne|gpu|cpu   Core ML compute units (default all)
 +//   batch=N         only use the batch-size-N function (pads smaller batches)
++//   dump='<file>'   append the first dump_max (default 4096) evaluated inputs to
++//                   <file> as raw float32 [n, 112, 8, 8], e.g. to calibrate or
++//                   check a converted model on real positions
 +
 +#import <CoreML/CoreML.h>
 +#import <Foundation/Foundation.h>
 +
 +#include <algorithm>
++#include <cstdio>
 +#include <map>
 +#include <mutex>
 +#include <string>
@@ -233,6 +237,13 @@ index 0000000..03e46ae
 +      else if (units == "cpu") compute_units_ = MLComputeUnitsCPUOnly;
 +      else throw Exception("coreml: units must be all, ne, gpu or cpu");
 +
++      const std::string dump = options.GetOrDefault<std::string>("dump", "");
++      dump_left_ = options.GetOrDefault<int>("dump_max", 4096);
++      if (!dump.empty()) {
++        dump_ = std::fopen(dump.c_str(), "ab");
++        if (!dump_) throw Exception("coreml: can't open dump file " + dump);
++      }
++
 +      forced_batch_ = options.GetOrDefault<int>("batch", 0);
 +      if (forced_batch_ > 0 &&
 +          std::find(batch_sizes_.begin(), batch_sizes_.end(), forced_batch_) == batch_sizes_.end()) {
@@ -249,6 +260,10 @@ index 0000000..03e46ae
 +      // isn't counted in the first timed batch.
 +      Model(forced_batch_ > 0 ? forced_batch_ : batch_sizes_.back());
 +    }
++  }
++
++  ~CoreMLNetwork() override {
++    if (dump_) std::fclose(dump_);
 +  }
 +
 +  const NetworkCapabilities& GetCapabilities() const override { return capabilities_; }
@@ -330,6 +345,13 @@ index 0000000..03e46ae
 +      }
 +    }
 +
++    if (dump_ && dump_left_ > 0) {
++      const int n = std::min(count, dump_left_);
++      std::fwrite(input.data(), sizeof(float), static_cast<size_t>(n) * kInputPlanes * 64, dump_);
++      dump_left_ -= n;
++      if (dump_left_ == 0) std::fflush(dump_);
++    }
++
 +    NSError* error = nil;
 +    MLMultiArray* array = [[MLMultiArray alloc]
 +        initWithDataPointer:input.data()
@@ -397,6 +419,8 @@ index 0000000..03e46ae
 +  NetworkCapabilities capabilities_;
 +  std::map<int, MLModel*> models_;
 +  std::mutex mutex_;
++  std::FILE* dump_ = nullptr;
++  int dump_left_ = 0;
 +};
 +
 +void CoreMLComputation::ComputeBlocking() { network_->Compute(this); }

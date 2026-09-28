@@ -8,7 +8,13 @@ lc0's coreml backend needs (so the phone never loads the original net).
 
 Usage:
   lc0_to_coreml.py --onnx net.onnx --net net.pb.gz --out outdir \
-      --batch-sizes 1,8,16,32,64,128,256 [--precision fp16|fp32]
+      --batch-sizes 1,8,16,32,64,128,256 [--precision fp16|fp32|w8|w8a8]
+      [--calibration positions.f32]
+
+Precisions: fp16/fp32 compute; w8 = int8 weights (per-channel) with fp16
+compute, which halves weight traffic; w8a8 = int8 weights and activations,
+calibrated on --calibration (raw float32 [n,112,8,8], e.g. from lc0's coreml
+backend dump= option).
 """
 import argparse
 import gzip
@@ -280,13 +286,52 @@ def network_format(net_path):
 
 # ---------------------------------------------------------------------------
 
+def load_positions(path, limit):
+    """Real positions for calibration; random ones if none were given."""
+    if path and os.path.exists(path):
+        x = np.fromfile(path, dtype=np.float32).reshape(-1, 112, 8, 8)
+        print(f"calibration: {len(x)} positions from {path}", flush=True)
+    else:
+        print("calibration: no positions file, using random planes", flush=True)
+        rng = np.random.default_rng(0)
+        x = (rng.random((limit, 112, 8, 8)) > 0.9).astype(np.float32)
+        x[:, 111] = 1
+    return x[:limit]
+
+
+def quantize(mlmodel, path, batch, calibration):
+    """int8 weights (and activations, if calibration data is given)."""
+    import coremltools.optimize as cto
+    if calibration is not None:
+        # Activation calibration runs the model, so it needs a loadable copy.
+        mlmodel.save(path)
+        mlmodel = ct.models.MLModel(path, compute_units=ct.ComputeUnit.CPU_ONLY)
+        n = max(1, min(8, len(calibration) // batch))
+        samples = [{"planes": calibration[i * batch:(i + 1) * batch]} for i in range(n)
+                   if len(calibration[i * batch:(i + 1) * batch]) == batch]
+        if not samples:
+            reps = -(-batch // len(calibration))
+            samples = [{"planes": np.tile(calibration, (reps, 1, 1, 1))[:batch]}]
+        print(f"batch {batch}: calibrating activations on {len(samples)} x {batch} positions", flush=True)
+        act = cto.coreml.OptimizationConfig(
+            global_config=cto.coreml.OpLinearQuantizerConfig(mode="linear_symmetric"))
+        mlmodel = cto.coreml.linear_quantize_activations(mlmodel, act, samples,
+                                                          calibration_op_group_size=200)
+    weights = cto.coreml.OptimizationConfig(global_config=cto.coreml.OpLinearQuantizerConfig(
+        mode="linear_symmetric", dtype="int8", granularity="per_channel", weight_threshold=2048))
+    return cto.coreml.linear_quantize_weights(mlmodel, weights)
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--onnx", required=True)
     p.add_argument("--net", required=True, help="original .pb.gz, for the network format")
     p.add_argument("--out", required=True)
     p.add_argument("--batch-sizes", default="1,8,16,32,64,128,256")
-    p.add_argument("--precision", choices=["fp16", "fp32"], default="fp16")
+    p.add_argument("--precision", choices=["fp16", "fp32", "w8", "w8a8"], default="fp16")
+    p.add_argument("--calibration", default=None,
+                   help="raw float32 [n,112,8,8] positions for w8a8 calibration")
+    p.add_argument("--calibration-positions", type=int, default=256)
     p.add_argument("--name", default=None)
     p.add_argument("--build-only", action="store_true",
                    help="only build the MIL programs (works without macOS)")
@@ -305,7 +350,10 @@ def main():
     os.makedirs(args.out, exist_ok=True)
     work = os.path.join(args.out, "_work")
     os.makedirs(work, exist_ok=True)
-    precision = ct.precision.FLOAT16 if args.precision == "fp16" else ct.precision.FLOAT32
+    precision = ct.precision.FLOAT32 if args.precision == "fp32" else ct.precision.FLOAT16
+    calibration = None
+    if args.precision == "w8a8":
+        calibration = load_positions(args.calibration, args.calibration_positions)
 
     parts = []
     for b in sizes:
@@ -318,6 +366,8 @@ def main():
                              minimum_deployment_target=ct.target.iOS18,
                              skip_model_load=True)
         path = os.path.join(work, f"b{b}.mlpackage")
+        if args.precision in ("w8", "w8a8"):
+            mlmodel = quantize(mlmodel, path, b, calibration)
         mlmodel.save(path)
         parts.append((b, path))
         del mlmodel, prog

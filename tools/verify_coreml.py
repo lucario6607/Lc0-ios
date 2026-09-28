@@ -41,7 +41,14 @@ def main():
     p.add_argument("--package", required=True)
     p.add_argument("--meta", required=True)
     p.add_argument("--batch-sizes", default="1,64")
+    p.add_argument("--positions", default=None,
+                   help="raw float32 [n,112,8,8] real positions (else random boards)")
+    p.add_argument("--units", default="CPU_ONLY,ALL")
     args = p.parse_args()
+    positions = None
+    if args.positions and os.path.exists(args.positions):
+        positions = np.fromfile(args.positions, dtype=np.float32).reshape(-1, 112, 8, 8)
+        print(f"checking on {len(positions)} real positions", flush=True)
 
     meta = json.load(open(args.meta))
     sess = ort.InferenceSession(args.onnx, providers=["CPUExecutionProvider"])
@@ -53,12 +60,21 @@ def main():
     for b in [int(s) for s in args.batch_sizes.split(",")]:
         if b not in meta["batch_sizes"]:
             continue
-        x = random_planes(b, rng)
+        if positions is not None:
+            reps = -(-b // len(positions))
+            x = np.tile(positions, (reps, 1, 1, 1))[:b] if b > len(positions) else positions[:b]
+            if b < 64 and len(positions) >= 64:
+                # Small batches: check several chunks so the numbers mean something.
+                x = positions[:64 - 64 % b]
+        else:
+            x = random_planes(b, rng)
         ref = dict(zip(onnx_outs, sess.run(None, {onnx_in: x})))
-        for units in ("CPU_ONLY", "CPU_AND_NE", "ALL"):
+        for units in args.units.split(","):
             model = ct.models.MLModel(args.package, function_name=f"b{b}",
                                       compute_units=getattr(ct.ComputeUnit, units))
-            out = model.predict({meta["input"]: x})
+            # The function takes exactly b positions; run x in chunks of b.
+            chunks = [model.predict({meta["input"]: x[i:i + b]}) for i in range(0, len(x), b)]
+            out = {k: np.concatenate([np.asarray(c[k]) for c in chunks]) for k in chunks[0]}
             report = []
             for short, mil_name in meta["outputs"].items():
                 onnx_name = next(o for o in onnx_outs if o.split("/")[-1] == short)
@@ -79,7 +95,8 @@ def main():
                     report.append(f"{short} maxdiff {diff:.3g}")
                     if short == "wdl" and diff > 0.2:
                         ok = False
-            line = f"batch {b} {units}: " + ", ".join(report)
+            source = "real" if positions is not None else "random"
+            line = f"{meta.get('precision', '')} batch {b} {units} ({len(x)} {source}): " + ", ".join(report)
             print(line, flush=True)
             if os.environ.get("GITHUB_ACTIONS"):
                 print(f"::notice title=Core ML check::{line}")
