@@ -205,6 +205,15 @@ struct CoreMLModelDetailView: View {
                 LabeledContent("Size", value: ByteCountFormatter.string(fromByteCount: model.bytes, countStyle: .file))
             }
             Section {
+                NavigationLink {
+                    ModelAnalysisView(model: model)
+                } label: {
+                    Label("Analyze model", systemImage: "cpu")
+                }
+            } footer: {
+                Text("Shows which operations run on the Neural Engine, GPU or CPU, and where the time goes.")
+            }
+            Section {
                 Text("Each batch size is a separately compiled function sharing one copy of the weights. The first run of each size on this device is slower while Core ML prepares it for the Neural Engine or GPU.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
