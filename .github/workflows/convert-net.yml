@@ -99,15 +99,21 @@ jobs:
         run: |
           set -uo pipefail
           # Logs need a sign-in; annotations don't.
+          report() {  # $1 = log, $2 = error|warning
+            tail -3 "$1" | while IFS= read -r line; do echo "::$2::${line:0:900}"; done
+          }
           fail() {
-            tail -3 "$1" | while IFS= read -r line; do echo "::error::${line:0:900}"; done
+            report "$1" error
             exit 1
           }
-          convert() {  # $1 = precision
+          convert() {  # $1 = precision; returns non-zero if conversion fails
             echo "::group::convert $1"
-            python tools/lc0_to_coreml.py --onnx work/net.onnx --net work/net.pb.gz \
+            if ! python tools/lc0_to_coreml.py --onnx work/net.onnx --net work/net.pb.gz \
               --out "work/$1" --name "$NAME-$1" --batch-sizes "$SIZES" --precision "$1" \
-              --calibration work/positions.f32 > "work/convert-$1.log" 2>&1 || fail "work/convert-$1.log"
+              --calibration work/positions.f32 > "work/convert-$1.log" 2>&1; then
+              echo "::endgroup::"
+              return 1
+            fi
             tail -5 "work/convert-$1.log"
             echo "::endgroup::"
             dir="work/pkg-$1/$NAME-$1.lc0coreml"
@@ -120,7 +126,7 @@ jobs:
           }
 
           # fp16 first: it plays the search that collects real positions.
-          convert fp16
+          convert fp16 || fail work/convert-fp16.log
           echo "::group::collect positions"
           build/lc0-mac/lc0 benchmark --weights= --backend=coreml \
             "--backend-opts=model='$PWD/work/pkg-fp16/$NAME-fp16.lc0coreml',units=cpu,dump='$PWD/work/positions.f32',dump_max=1024" \
@@ -131,10 +137,20 @@ jobs:
 
           smallest="$(echo "$SIZES" | tr ',' '\n' | sort -n | head -1)"
           for v in $(echo "$VARIANTS" | tr ',' ' '); do
-            [ "$v" = fp16 ] || convert "$v"
-            python tools/verify_coreml.py --onnx work/net.onnx --package "work/$v/$NAME-$v.mlpackage" \
+            # Extra variants are experiments: skip one that fails instead of losing the rest.
+            if [ "$v" != fp16 ] && ! convert "$v"; then
+              echo "::warning title=Skipped $v::conversion failed"
+              report "work/convert-$v.log" warning
+              continue
+            fi
+            if ! python tools/verify_coreml.py --onnx work/net.onnx --package "work/$v/$NAME-$v.mlpackage" \
               --meta "work/$v/lc0coreml.json" --positions work/positions.f32 \
-              --batch-sizes "$smallest,8,64" --units CPU_ONLY > "work/verify-$v.log" 2>&1 || fail "work/verify-$v.log"
+              --batch-sizes "$smallest,8,64" --units CPU_ONLY > "work/verify-$v.log" 2>&1; then
+              [ "$v" = fp16 ] && fail "work/verify-$v.log"
+              echo "::warning title=Skipped $v::accuracy check failed"
+              report "work/verify-$v.log" warning
+              continue
+            fi
             cat "work/verify-$v.log"
             aa archive -d "work/pkg-$v" -o "work/$NAME-$v.lc0coreml.aar"
             echo "::notice title=Converted $v::$NAME-$v.lc0coreml.aar ($(du -h "work/$NAME-$v.lc0coreml.aar" | cut -f1))"
