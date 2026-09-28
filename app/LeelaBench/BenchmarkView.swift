@@ -14,7 +14,7 @@ struct BenchmarkView: View {
     /// A batch-size sweep in progress: one lc0 run per size.
     private struct SweepState {
         var config: BenchConfig
-        var networkPath: String
+        var paths: RunPaths
         var sizes: [Int]
         var index = 0
         var resultID = UUID()
@@ -30,16 +30,22 @@ struct BenchmarkView: View {
 
     private var isBusy: Bool { runner.isRunning || sweep != nil }
 
-    /// The selected net's file, or the Core ML model folder for the native backend.
-    private var networkPath: String? {
-        config.backend.usesCoreMLModel ? selectedCoreMLModel?.url.path : nets.url(named: config.network)?.path
+    /// The selected net file and Core ML model folder, whichever this run uses.
+    private var paths: RunPaths {
+        RunPaths(net: nets.url(named: config.network)?.path, model: selectedCoreMLModel?.url.path)
+    }
+
+    /// Everything the run needs has been picked.
+    private var canRun: Bool {
+        (!config.needsNet || paths.net != nil) && (!config.needsModel || paths.model != nil)
+            && !(config.backend == .multiplex && config.muxDevices.isEmpty)
     }
 
     private var selectedCoreMLModel: CoreMLModelInfo? { nets.coremlModel(named: config.coremlModel) }
 
-    /// Sweep sizes, limited to those compiled into the model for the native backend.
+    /// Sweep sizes, limited to those compiled into the Core ML model when one is used.
     private var sweepSizes: [Int] {
-        guard config.backend.usesCoreMLModel else { return config.parsedSweepSizes }
+        guard config.needsModel else { return config.parsedSweepSizes }
         let available = Set(selectedCoreMLModel?.batchSizes ?? [])
         return config.parsedSweepSizes.filter(available.contains)
     }
@@ -217,7 +223,7 @@ struct BenchmarkView: View {
 
     @ViewBuilder
     private var networkSection: some View {
-        if config.backend.usesCoreMLModel {
+        if config.needsModel {
             Section {
                 if nets.coremlModels.isEmpty {
                     Text("No Core ML models yet. Convert a net with the \"Convert net to Core ML\" workflow, then add it in the Networks tab.")
@@ -234,7 +240,8 @@ struct BenchmarkView: View {
             } header: {
                 Text("Core ML model")
             }
-        } else {
+        }
+        if config.needsNet {
             netPickerSection
         }
     }
@@ -251,7 +258,7 @@ struct BenchmarkView: View {
                     }
                 }
             }
-            if !nets.coremlModels.isEmpty && Backend.available.contains(.coreml) {
+            if config.backend != .multiplex && !nets.coremlModels.isEmpty && Backend.available.contains(.coreml) {
                 Button {
                     config.backend = .coreml
                 } label: {
@@ -271,7 +278,24 @@ struct BenchmarkView: View {
                     ForEach(CoreMLUnits.allCases) { Text($0.title).tag($0) }
                 }
             }
-            if config.backend == .coreml && config.mode != .sweep {
+            if config.backend == .multiplex {
+                ForEach(MuxDevice.allCases) { device in
+                    Toggle(device.title, isOn: Binding(
+                        get: { config.muxDevices.contains(device) },
+                        set: { on in
+                            config.muxDevices.removeAll { $0 == device }
+                            if on { config.muxDevices.append(device) }
+                            config.muxDevices.sort { $0.rawValue < $1.rawValue }
+                        }))
+                }
+                if config.muxDevices.contains(.blas) {
+                    Label("BLAS runs the original .pb.gz net, which is loaded as well as the Core ML model. For BT4 that's roughly an extra gigabyte and may hit the app's memory limit; CPU (Core ML) avoids that.",
+                          systemImage: "memorychip")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                }
+            }
+            if (config.backend == .coreml || config.backend == .multiplex) && config.mode != .sweep {
                 NumberRow(title: "Batch (0 = auto)", value: $config.coremlBatch, range: 0...1024)
                 if config.coremlBatch > 0, let model = selectedCoreMLModel,
                    !model.batchSizes.contains(config.coremlBatch) {
@@ -303,7 +327,7 @@ struct BenchmarkView: View {
                         .foregroundStyle(.orange)
                 }
             }
-            if config.backend != .random && config.backend != .coreml {
+            if config.backend != .random && config.backend != .coreml && config.backend != .multiplex {
                 LabeledContent("Options") {
                     TextField(config.backend.optionsHint, text: $config.backendOpts)
                         .multilineTextAlignment(.trailing)
@@ -323,6 +347,8 @@ struct BenchmarkView: View {
                 Text("Core ML decides per layer where to run within the allowed units, and always keeps the CPU as a fallback. The first run per network is slow while Core ML compiles it.")
             case .coreml:
                 Text("Runs a model converted ahead of time on a Mac, directly with Core ML: no ONNX Runtime and no on-phone conversion, so it needs far less memory. Batch 0 picks the smallest compiled size that fits each call; a fixed batch pads to that size.")
+            case .multiplex:
+                Text("Runs the ticked devices at the same time (lc0's multiplexing backend): each has its own worker pulling batches from one shared queue, so faster devices take more. Threads are raised to at least the number of devices + 1 so every device has work.")
             case .blas, .eigen, .onnxCPU:
                 Text("Runs on the CPU. Try more threads.")
             case .random:
@@ -349,7 +375,7 @@ struct BenchmarkView: View {
                         .font(.body.monospaced())
                 }
                 NumberRow(title: "Batches per size", value: $config.batches, range: 2...10_000)
-                if config.backend.usesCoreMLModel {
+                if config.needsModel {
                     Text("Each size uses the model's precompiled function for that batch size, measured only at that size. Sizes not in the model are skipped\(sweepSizes.isEmpty ? "" : "; this sweep runs " + sweepSizes.map(String.init).joined(separator: ", ")).")
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -380,8 +406,10 @@ struct BenchmarkView: View {
                         .autocorrectionDisabled()
                         .font(.body.monospaced())
                 }
-                if let networkPath {
-                    Text("lc0 " + config.arguments(networkPath: (networkPath as NSString).lastPathComponent)
+                if canRun {
+                    Text("lc0 " + config.arguments(paths: RunPaths(
+                        net: paths.net.map { ($0 as NSString).lastPathComponent },
+                        model: paths.model.map { ($0 as NSString).lastPathComponent }))
                         .joined(separator: " "))
                         .font(.caption.monospaced())
                         .foregroundStyle(.secondary)
@@ -405,7 +433,7 @@ struct BenchmarkView: View {
                     .font(.headline)
                     .frame(maxWidth: .infinity)
             }
-            .disabled(isBusy || networkPath == nil
+            .disabled(isBusy || !canRun
                       || (config.mode == .sweep && sweepSizes.isEmpty))
         } footer: {
             if DeviceInfo.lowPowerMode {
@@ -427,15 +455,16 @@ struct BenchmarkView: View {
     }
 
     private func run() {
-        guard let path = networkPath else { return }
+        guard canRun else { return }
         let snapshot = config
+        let paths = self.paths
         lastResultID = nil
         if snapshot.mode == .sweep {
-            sweep = SweepState(config: snapshot, networkPath: path, sizes: sweepSizes)
+            sweep = SweepState(config: snapshot, paths: paths, sizes: sweepSizes)
             runSweepStep()
             return
         }
-        let args = snapshot.arguments(networkPath: path)
+        let args = snapshot.arguments(paths: paths)
         runner.run(args) { outcome in
             let result = BenchResult(config: snapshot, arguments: args, outcome: outcome)
             results.add(result)
@@ -450,7 +479,7 @@ struct BenchmarkView: View {
             sweep = nil
             return
         }
-        let args = state.config.sweepArguments(networkPath: state.networkPath, batch: size)
+        let args = state.config.sweepArguments(paths: state.paths, batch: size)
         runner.run(args) { outcome in
             guard var state = sweep else { return }
             if let point = outcome.parsed.points.last(where: { $0.batch == size }) {

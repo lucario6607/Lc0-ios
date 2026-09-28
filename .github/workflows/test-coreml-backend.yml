@@ -65,4 +65,8 @@ jobs:
             --batches=3 --start-batch-size=1 --max-batch-size=40 --batch-step=13 || fail=1
           run bench --weights= --backend=coreml "--backend-opts=model='$MODEL_DIR',units=cpu,batch=16" \
             --minibatch-size=16 || fail=1
+          # Two Core ML instances side by side, the way the app's Multiplex backend runs them.
+          run backendbench --weights= --backend=multiplexing \
+            "--backend-opts=ane(backend=coreml,model='$MODEL_DIR',units=ne,batch=16,max_batch=16),gpu(backend=coreml,model='$MODEL_DIR',units=gpu,batch=16,max_batch=16)" \
+            --threads=3 --batches=6 --start-batch-size=16 --max-batch-size=16 || fail=1
           exit $fail

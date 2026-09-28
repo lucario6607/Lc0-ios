@@ -32,6 +32,7 @@ enum Backend: String, CaseIterable, Codable, Identifiable {
     case onnxCoreML = "onnx-coreml"
     case onnxCPU = "onnx-cpu"
     case coreml
+    case multiplex = "multiplexing"
     case random
     var id: String { rawValue }
 
@@ -43,6 +44,7 @@ enum Backend: String, CaseIterable, Codable, Identifiable {
         case .onnxCoreML: return "Core ML (via ONNX)"
         case .onnxCPU: return "ONNX Runtime (CPU)"
         case .coreml: return "Core ML (native)"
+        case .multiplex: return "Multiplex (several devices)"
         case .random: return "Random (no network)"
         }
     }
@@ -52,7 +54,7 @@ enum Backend: String, CaseIterable, Codable, Identifiable {
         case .metal: return "batch=64"
         case .blas, .eigen: return "batch_size=256"
         case .onnxCoreML, .onnxCPU: return "batch=64"
-        case .coreml, .random: return ""
+        case .coreml, .multiplex, .random: return ""
         }
     }
 
@@ -62,10 +64,12 @@ enum Backend: String, CaseIterable, Codable, Identifiable {
     var usesCoreMLModel: Bool { self == .coreml }
 
     /// Backends where a batch-size sweep makes sense (each size is its own compiled model).
-    var supportsSweep: Bool { isOnnx || self == .coreml }
+    var supportsSweep: Bool { isOnnx || self == .coreml || self == .multiplex }
 
     static var available: [Backend] {
-        allCases.filter { (!$0.isOnnx || BuildInfo.hasOnnx) && ($0 != .coreml || BuildInfo.hasCoreML) }
+        allCases.filter {
+            (!$0.isOnnx || BuildInfo.hasOnnx) && (($0 != .coreml && $0 != .multiplex) || BuildInfo.hasCoreML)
+        }
     }
 }
 
@@ -97,6 +101,41 @@ enum CoreMLUnits: Int, CaseIterable, Codable, Identifiable {
     }
 }
 
+/// A device in a multiplexed run. lc0's `multiplexing` backend gives each one
+/// a worker thread pulling from one shared queue, so faster devices simply take
+/// more batches and throughputs add up.
+enum MuxDevice: String, CaseIterable, Codable, Identifiable {
+    case ane, gpu, cpu, blas
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .ane: return "Neural Engine (Core ML)"
+        case .gpu: return "GPU (Core ML)"
+        case .cpu: return "CPU (Core ML)"
+        case .blas: return "CPU (BLAS)"
+        }
+    }
+
+    var shortTitle: String {
+        switch self {
+        case .ane: return "ANE"
+        case .gpu: return "GPU"
+        case .cpu: return "CPU"
+        case .blas: return "BLAS"
+        }
+    }
+
+    /// BLAS runs the original .pb.gz net; the others run the converted Core ML model.
+    var usesNet: Bool { self == .blas }
+}
+
+/// Files a run needs: the lc0 net and/or the converted Core ML model folder.
+struct RunPaths {
+    var net: String?
+    var model: String?
+}
+
 /// ONNX model precision. lc0 defaults to fp16 for Core ML and fp32 for CPU.
 enum Precision: String, CaseIterable, Codable, Identifiable {
     case auto, fp16, fp32
@@ -125,6 +164,8 @@ struct BenchConfig: Codable, Equatable {
     var coremlModel = ""
     /// coreml backend batch size; 0 = pick per call from the model's sizes.
     var coremlBatch = 0
+    /// Devices for the Multiplex backend.
+    var muxDevices: [MuxDevice] = [.ane, .gpu]
     var mode = BenchMode.backendbench
     var threads = 1
 
@@ -164,17 +205,59 @@ struct BenchConfig: Codable, Equatable {
         }
     }
 
-    /// The net or Core ML model this run uses, by file name.
-    var selectedName: String { backend.usesCoreMLModel ? coremlModel : network }
-
-    var effectiveBackendOpts: String {
-        backend.usesCoreMLModel ? backendOpts(sessions: 0, batch: coremlBatch)
-                                : backendOpts(sessions: onnxSessions, batch: onnxBatch)
+    /// Whether this run needs the converted Core ML model.
+    var needsModel: Bool {
+        backend == .coreml || (backend == .multiplex && muxDevices.contains { !$0.usesNet })
     }
 
-    /// `sessions`/`batch` of 0 leave lc0's defaults. `modelPath` is the coreml
-    /// backend's model folder (left out for display).
+    /// Whether this run needs the lc0 .pb.gz net.
+    var needsNet: Bool {
+        switch backend {
+        case .coreml: return false
+        case .multiplex: return muxDevices.contains(.blas)
+        default: return true
+        }
+    }
+
+    /// The net and/or Core ML model this run uses, by file name.
+    var selectedName: String {
+        switch (needsModel, needsNet) {
+        case (true, true): return "\(coremlModel) + \(network)"
+        case (true, false): return coremlModel
+        default: return network
+        }
+    }
+
+    /// Search/benchmark threads. Multiplexing needs more requests in flight than
+    /// devices, or some devices sit idle.
+    var effectiveThreads: Int {
+        backend == .multiplex ? max(threads, muxDevices.count + 1) : threads
+    }
+
+    /// Whether the batch comes from the Core ML model settings (coremlBatch).
+    private var usesModelBatch: Bool { needsModel || backend == .multiplex }
+
+    var effectiveBackendOpts: String {
+        usesModelBatch ? backendOpts(sessions: 0, batch: coremlBatch)
+                       : backendOpts(sessions: onnxSessions, batch: onnxBatch)
+    }
+
+    /// `sessions`/`batch` of 0 leave lc0's defaults. `modelPath` is the Core ML
+    /// model folder (left out for display).
     func backendOpts(sessions: Int, batch: Int, modelPath: String? = nil) -> String {
+        if backend == .multiplex {
+            let model = modelPath.map { ",model='\($0)'" } ?? ""
+            let fixed = batch > 0 ? ",batch=\(batch),max_batch=\(batch)" : ""
+            return muxDevices.map { device in
+                switch device {
+                case .blas:
+                    return "blas(backend=blas\(batch > 0 ? ",max_batch=\(batch)" : ""))"
+                case .ane, .gpu, .cpu:
+                    let units = device == .ane ? "ne" : device.rawValue
+                    return "\(device.rawValue)(backend=coreml\(model),units=\(units)\(fixed))"
+                }
+            }.joined(separator: ",")
+        }
         var parts: [String] = []
         if backend == .coreml {
             if let modelPath { parts.append("model='\(modelPath)'") }
@@ -198,33 +281,42 @@ struct BenchConfig: Codable, Equatable {
         case .coreml:
             let batch = mode == .sweep ? " sweep" : coremlBatch > 0 ? " b\(coremlBatch)" : ""
             return "coreml-native-\(coreMLUnits.shortTitle)\(batch)"
+        case .multiplex:
+            let batch = mode == .sweep ? " sweep" : coremlBatch > 0 ? " b\(coremlBatch)" : ""
+            return "mux[" + muxDevices.map(\.shortTitle).joined(separator: "+") + "]\(batch)"
         default: return backend.rawValue
         }
     }
 
-    /// One sweep step: a single session of `batch`, measured at exactly `batch`.
-    func sweepArguments(networkPath: String, batch: Int) -> [String] {
-        let coreml = backend.usesCoreMLModel
-        let opts = coreml ? backendOpts(sessions: 0, batch: batch, modelPath: networkPath)
-                          : backendOpts(sessions: 1, batch: batch)
-        var args = ["backendbench", "--weights=\(coreml ? "" : networkPath)", "--backend=\(backend.rawValue)",
-                    "--backend-opts=\(opts)",
-                    "--threads=\(threads)", "--batches=\(batches)",
-                    "--start-batch-size=\(batch)", "--max-batch-size=\(batch)", "--batch-step=1"]
-        return args
+    /// Backend options with real file paths, for running.
+    private func runBackendOpts(paths: RunPaths, sessions: Int, batch: Int) -> String {
+        usesModelBatch ? backendOpts(sessions: 0, batch: batch, modelPath: paths.model)
+                       : backendOpts(sessions: sessions, batch: batch)
     }
 
-    func arguments(networkPath: String) -> [String] {
+    /// The Core ML model folder goes in the backend options; lc0 only loads a
+    /// weights file when some part of the run needs the .pb.gz net.
+    private func weightsArgument(_ paths: RunPaths) -> String {
+        "--weights=\(needsNet ? paths.net ?? "" : "")"
+    }
+
+    /// One sweep step: a single session / function of `batch`, measured at exactly `batch`.
+    func sweepArguments(paths: RunPaths, batch: Int) -> [String] {
+        ["backendbench", weightsArgument(paths), "--backend=\(backend.rawValue)",
+         "--backend-opts=\(runBackendOpts(paths: paths, sessions: 1, batch: batch))",
+         "--threads=\(effectiveThreads)", "--batches=\(batches)",
+         "--start-batch-size=\(batch)", "--max-batch-size=\(batch)", "--batch-step=1"]
+    }
+
+    func arguments(paths: RunPaths) -> [String] {
         if mode == .sweep {
-            return sweepArguments(networkPath: networkPath, batch: parsedSweepSizes.first ?? 64)
+            return sweepArguments(paths: paths, batch: parsedSweepSizes.first ?? 64)
         }
-        // The coreml backend loads its model folder itself; no lc0 weights file.
-        let coreml = backend.usesCoreMLModel
-        var args = [mode.rawValue, "--weights=\(coreml ? "" : networkPath)", "--backend=\(backend.rawValue)"]
-        let opts = coreml ? backendOpts(sessions: 0, batch: coremlBatch, modelPath: networkPath)
-                          : effectiveBackendOpts
+        var args = [mode.rawValue, weightsArgument(paths), "--backend=\(backend.rawValue)"]
+        let opts = runBackendOpts(paths: paths, sessions: onnxSessions,
+                                  batch: usesModelBatch ? coremlBatch : onnxBatch)
         if !opts.isEmpty { args.append("--backend-opts=\(opts)") }
-        args.append("--threads=\(threads)")
+        args.append("--threads=\(effectiveThreads)")
         switch mode {
         case .backendbench, .sweep:
             args += ["--batches=\(batches)", "--start-batch-size=\(startBatch)",
@@ -260,6 +352,7 @@ struct BenchConfig: Codable, Equatable {
         onnxBatch = value(.onnxBatch, d.onnxBatch)
         coremlModel = value(.coremlModel, d.coremlModel)
         coremlBatch = value(.coremlBatch, d.coremlBatch)
+        muxDevices = value(.muxDevices, d.muxDevices)
         mode = value(.mode, d.mode)
         threads = value(.threads, d.threads)
         batches = value(.batches, d.batches)
