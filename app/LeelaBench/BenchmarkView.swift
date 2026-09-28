@@ -107,6 +107,9 @@ struct BenchmarkView: View {
                 if !Backend.available.contains(config.backend) { config.backend = .metal }
             }
             .onChange(of: config) { newConfig in
+                if newConfig.backend == .onnxCoreML && newConfig.coreMLUnits == .cpuOnly {
+                    config.coreMLUnits = .cpuAndNeuralEngine  // onnx-coreml has no CPU-only mode
+                }
                 if newConfig.mode == .sweep && !newConfig.backend.supportsSweep {
                     config.mode = .backendbench
                 }
@@ -275,7 +278,9 @@ struct BenchmarkView: View {
             }
             if config.backend == .onnxCoreML || config.backend == .coreml {
                 Picker("Compute units", selection: $config.coreMLUnits) {
-                    ForEach(CoreMLUnits.allCases) { Text($0.title).tag($0) }
+                    ForEach(config.backend == .onnxCoreML ? CoreMLUnits.onnxCases : CoreMLUnits.allCases) {
+                        Text($0.title).tag($0)
+                    }
                 }
             }
             if config.backend == .multiplex {

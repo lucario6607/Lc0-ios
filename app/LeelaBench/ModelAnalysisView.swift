@@ -32,7 +32,7 @@ struct ModelAnalysis {
 
     /// Ops that could run on the Neural Engine setting but don't.
     var offNeuralEngine: [PlannedOp] {
-        guard units != .cpuAndGPU else { return [] }
+        guard units == .cpuAndNeuralEngine || units == .all else { return [] }
         return ops.filter { $0.device != "ANE" }
     }
 
@@ -124,6 +124,7 @@ extension CoreMLUnits {
         case .cpuAndGPU: return .cpuAndGPU
         case .cpuAndNeuralEngine: return .cpuAndNeuralEngine
         case .all: return .all
+        case .cpuOnly: return .cpuOnly
         }
     }
 }
@@ -194,7 +195,7 @@ struct ModelAnalysisView: View {
                         }
                     }
                 }
-                if units != .cpuAndGPU {
+                if units == .cpuAndNeuralEngine || units == .all {
                     Section("Not on the Neural Engine (\(a.offNeuralEngine.count))") {
                         if a.offNeuralEngine.isEmpty {
                             Label("Everything runs on the Neural Engine", systemImage: "checkmark.circle")

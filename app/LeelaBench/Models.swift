@@ -76,12 +76,15 @@ enum Backend: String, CaseIterable, Codable, Identifiable {
 /// Core ML compute units, passed to lc0's onnx-coreml backend as `gpu=N`.
 enum CoreMLUnits: Int, CaseIterable, Codable, Identifiable {
     case cpuAndGPU = 0, cpuAndNeuralEngine = 1, all = 2
+    /// Native backend only: lc0's onnx-coreml has no CPU-only setting.
+    case cpuOnly = 3
     var id: Int { rawValue }
     var title: String {
         switch self {
         case .cpuAndGPU: return "CPU + GPU"
         case .cpuAndNeuralEngine: return "CPU + Neural Engine"
         case .all: return "All"
+        case .cpuOnly: return "CPU only"
         }
     }
     var shortTitle: String {
@@ -89,6 +92,7 @@ enum CoreMLUnits: Int, CaseIterable, Codable, Identifiable {
         case .cpuAndGPU: return "GPU"
         case .cpuAndNeuralEngine: return "ANE"
         case .all: return "all"
+        case .cpuOnly: return "CPU"
         }
     }
     /// Value of the native coreml backend's `units` option.
@@ -97,8 +101,11 @@ enum CoreMLUnits: Int, CaseIterable, Codable, Identifiable {
         case .cpuAndGPU: return "gpu"
         case .cpuAndNeuralEngine: return "ne"
         case .all: return "all"
+        case .cpuOnly: return "cpu"
         }
     }
+    /// Units the onnx-coreml backend can be asked for (as gpu=0/1/2).
+    static var onnxCases: [CoreMLUnits] { [.cpuAndGPU, .cpuAndNeuralEngine, .all] }
 }
 
 /// A device in a multiplexed run. lc0's `multiplexing` backend gives each one
