@@ -102,10 +102,10 @@ index dc83a19..fff5f0c 100644
  }
 diff --git a/src/neural/backends/coreml/network_coreml.mm b/src/neural/backends/coreml/network_coreml.mm
 new file mode 100644
-index 0000000..099fde3
+index 0000000..55db9fd
 --- /dev/null
 +++ b/src/neural/backends/coreml/network_coreml.mm
-@@ -0,0 +1,362 @@
+@@ -0,0 +1,369 @@
 +/*
 +  This file is part of Leela Chess Zero.
 +  Copyright (C) 2026 The LCZero Authors
@@ -142,6 +142,7 @@ index 0000000..099fde3
 +#import <Foundation/Foundation.h>
 +
 +#include <algorithm>
++#include <chrono>
 +#include <cstdio>
 +#include <iterator>
 +#include <map>
@@ -324,11 +325,17 @@ index 0000000..099fde3
 +      config.computeUnits = compute_units_;
 +      config.functionName = [NSString stringWithFormat:@"b%d", batch];
 +      NSError* error = nil;
++      const auto start = std::chrono::steady_clock::now();
 +      MLModel* model = [MLModel modelWithContentsOfURL:model_url_ configuration:config error:&error];
 +      if (!model) {
 +        *error_text = error ? std::string(error.localizedDescription.UTF8String) : "unknown error";
 +        return nil;
 +      }
++      // Loading a size can take seconds (Neural Engine compilation); when it
++      // happens mid-search it shows up as a slow search, so say so.
++      const double seconds =
++          std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
++      CERR << "Core ML: prepared batch " << batch << " in " << seconds << " s";
 +      models_[batch] = model;
 +      return model;
 +    }
