@@ -12,7 +12,8 @@ Usage:
       [--calibration positions.f32]
 
 Precisions: fp16/fp32 compute; w8 = int8 weights (per-channel) with fp16
-compute, which halves weight traffic; w8a8 = int8 weights and activations,
+compute, which halves weight traffic; w4 = int4 weights (per block of 32),
+halving it again; w8a8 = int8 weights and activations,
 calibrated on --calibration (raw float32 [n,112,8,8], e.g. from lc0's coreml
 backend dump= option).
 """
@@ -299,8 +300,8 @@ def load_positions(path, limit):
     return x[:limit]
 
 
-def quantize(mlmodel, path, batch, calibration):
-    """int8 weights (and activations, if calibration data is given)."""
+def quantize(mlmodel, path, batch, calibration, bits=8):
+    """int8/int4 weights (and int8 activations, if calibration data is given)."""
     import coremltools.optimize as cto
     if calibration is not None:
         # Activation calibration runs the model, so it needs a loadable copy.
@@ -317,9 +318,15 @@ def quantize(mlmodel, path, batch, calibration):
             global_config=cto.coreml.OpLinearQuantizerConfig(mode="linear_symmetric"))
         mlmodel = cto.coreml.linear_quantize_activations(mlmodel, act, samples,
                                                           calibration_op_group_size=200)
-    weights = cto.coreml.OptimizationConfig(global_config=cto.coreml.OpLinearQuantizerConfig(
-        mode="linear_symmetric", dtype="int8", granularity="per_channel", weight_threshold=2048))
-    return cto.coreml.linear_quantize_weights(mlmodel, weights)
+    if bits == 4:
+        # int4 needs finer scales to stay accurate: one per block of 32 inputs.
+        op = cto.coreml.OpLinearQuantizerConfig(
+            mode="linear_symmetric", dtype="int4", granularity="per_block", block_size=32,
+            weight_threshold=2048)
+    else:
+        op = cto.coreml.OpLinearQuantizerConfig(
+            mode="linear_symmetric", dtype="int8", granularity="per_channel", weight_threshold=2048)
+    return cto.coreml.linear_quantize_weights(mlmodel, cto.coreml.OptimizationConfig(global_config=op))
 
 
 def main():
@@ -328,7 +335,7 @@ def main():
     p.add_argument("--net", required=True, help="original .pb.gz, for the network format")
     p.add_argument("--out", required=True)
     p.add_argument("--batch-sizes", default="1,8,16,32,64,128,256")
-    p.add_argument("--precision", choices=["fp16", "fp32", "w8", "w8a8"], default="fp16")
+    p.add_argument("--precision", choices=["fp16", "fp32", "w8", "w8a8", "w4"], default="fp16")
     p.add_argument("--calibration", default=None,
                    help="raw float32 [n,112,8,8] positions for w8a8 calibration")
     p.add_argument("--calibration-positions", type=int, default=256)
@@ -366,8 +373,8 @@ def main():
                              minimum_deployment_target=ct.target.iOS18,
                              skip_model_load=True)
         path = os.path.join(work, f"b{b}.mlpackage")
-        if args.precision in ("w8", "w8a8"):
-            mlmodel = quantize(mlmodel, path, b, calibration)
+        if args.precision in ("w8", "w8a8", "w4"):
+            mlmodel = quantize(mlmodel, path, b, calibration, bits=4 if args.precision == "w4" else 8)
         mlmodel.save(path)
         parts.append((b, path))
         del mlmodel, prog
