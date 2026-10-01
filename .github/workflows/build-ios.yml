@@ -57,7 +57,14 @@ jobs:
 
       - name: Build Stockfish for iOS
         if: steps.sfcache.outputs.cache-hit != 'true'
-        run: bash scripts/build_stockfish.sh
+        run: |
+          # Logs need a sign-in on GitHub; annotations don't, so surface errors there.
+          if ! bash scripts/build_stockfish.sh > "$RUNNER_TEMP/stockfish.log" 2>&1; then
+            { grep -E "error:|Error|No such|not found" "$RUNNER_TEMP/stockfish.log" | head -6; tail -3 "$RUNNER_TEMP/stockfish.log"; } \
+              | while IFS= read -r line; do echo "::error::${line:0:900}"; done
+            exit 1
+          fi
+          tail -3 "$RUNNER_TEMP/stockfish.log"
 
       - name: Generate Xcode project
         working-directory: app
