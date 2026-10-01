@@ -57,8 +57,8 @@ for f in $SOURCES ios_entry.cpp; do
   [ "$f" = main.cpp ] && extra="-Dmain=stockfish_main"
   echo "$CXX ${FLAGS[*]} $extra -c $f -o $OBJ/$(echo "$f" | tr / _).o"
 done > "$WORK/compile.txt"
-# Compile in parallel.
-tr '\n' '\0' < "$WORK/compile.txt" | xargs -0 -P "$(sysctl -n hw.ncpu)" -I{} sh -c '{}'
+# Compile in parallel. (Not xargs -I: BSD xargs limits it to 255-byte lines.)
+tr '\n' '\0' < "$WORK/compile.txt" | xargs -0 -n 1 -P "$(sysctl -n hw.ncpu)" sh -c 'eval "$1"' sh
 
 xcrun libtool -static -o "$VENDOR/lib/libstockfish.a" "$OBJ"/*.o
 NET="$(grep -o 'nn-[0-9a-f]*\.nnue' "$SRC/evaluate.h" | head -1)"
