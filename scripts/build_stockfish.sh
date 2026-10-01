@@ -52,9 +52,10 @@ OBJ="$WORK/obj"
 rm -rf "$OBJ" && mkdir -p "$OBJ"
 cd "$SRC"  # incbin resolves the net's path relative to here
 for f in $SOURCES ios_entry.cpp; do
-  extra=()
-  [ "$f" = main.cpp ] && extra=(-Dmain=stockfish_main)
-  echo "$CXX ${FLAGS[*]} ${extra[*]} -c $f -o $OBJ/$(echo "$f" | tr / _).o"
+  # (A plain string: macOS's bash 3.2 treats an empty array as unbound under set -u.)
+  extra=""
+  [ "$f" = main.cpp ] && extra="-Dmain=stockfish_main"
+  echo "$CXX ${FLAGS[*]} $extra -c $f -o $OBJ/$(echo "$f" | tr / _).o"
 done > "$WORK/compile.txt"
 # Compile in parallel.
 tr '\n' '\0' < "$WORK/compile.txt" | xargs -0 -P "$(sysctl -n hw.ncpu)" -I{} sh -c '{}'
