@@ -32,6 +32,7 @@ targets:
         LC0Version: $(LC0_VERSION_INFO)
         LC0Onnx: $(LC0_ONNX)
         LC0CoreML: $(LC0_COREML)
+        LC0Stockfish: $(LC0_STOCKFISH)
         UILaunchScreen: {}
         UIFileSharingEnabled: true
         LSSupportsOpeningDocumentsInPlace: true

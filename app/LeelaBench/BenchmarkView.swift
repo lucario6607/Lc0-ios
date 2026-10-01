@@ -37,7 +37,8 @@ struct BenchmarkView: View {
 
     /// Everything the run needs has been picked.
     private var canRun: Bool {
-        (!config.needsNet || paths.net != nil) && (!config.needsModel || paths.model != nil)
+        if config.engine == .stockfish { return BuildInfo.stockfishVersion != nil }
+        return (!config.needsNet || paths.net != nil) && (!config.needsModel || paths.model != nil)
             && !(config.backend == .multiplex && config.muxDevices.isEmpty)
     }
 
@@ -70,9 +71,21 @@ struct BenchmarkView: View {
                 } else if let lastResult {
                     lastResultSection(lastResult)
                 }
-                backendSection
-                networkSection
-                modeSection
+                if BuildInfo.stockfishVersion != nil {
+                    Section {
+                        Picker("Engine", selection: $config.engine) {
+                            ForEach(ChessEngine.allCases) { Text($0.title).tag($0) }
+                        }
+                        .pickerStyle(.segmented)
+                    }
+                }
+                if config.engine == .stockfish {
+                    stockfishSection
+                } else {
+                    backendSection
+                    networkSection
+                    modeSection
+                }
                 runSection
             }
             .navigationTitle("LeelaBench")
@@ -154,6 +167,8 @@ struct BenchmarkView: View {
                 ProgressView().controlSize(.small)
                 if let sweep, let size = sweep.currentSize {
                     Text("Sweep: batch \(size) (\(sweep.index + 1) of \(sweep.sizes.count))")
+                } else if config.engine == .stockfish {
+                    Text("Running Stockfish \(config.sfTest == .sfBench ? "bench" : "speedtest")")
                 } else {
                     Text("Running \(config.mode.title.lowercased()) benchmark")
                 }
@@ -203,6 +218,12 @@ struct BenchmarkView: View {
                                value: "\(last.nps.formatted()) nps")
                     .monospacedDigit()
             }
+        } else if config.engine == .stockfish {
+            Text(parsed.currentPosition > 0
+                 ? "Stockfish \(config.sfTest.title.replacingOccurrences(of: "SF ", with: "")): position \(parsed.currentPosition)/\(parsed.totalPositions ?? 0)"
+                 : "Stockfish is running. Results appear when it finishes.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
         } else {
             Text(config.backend == .onnxCoreML
                  ? "Loading the network. Core ML compiles the model on first use, which can take a few minutes for big nets."
@@ -341,7 +362,7 @@ struct BenchmarkView: View {
                         .font(.body.monospaced())
                 }
             }
-            Stepper("Threads: \(config.threads)", value: $config.threads, in: 1...16)
+            ThreadsRow(threads: $config.threads)
         } header: {
             Text("Backend")
         } footer: {
@@ -365,7 +386,7 @@ struct BenchmarkView: View {
     private var modeSection: some View {
         Section {
             Picker("Mode", selection: $config.mode) {
-                ForEach(BenchMode.allCases.filter { $0 != .sweep || config.backend.supportsSweep }) {
+                ForEach(BenchMode.lc0Cases.filter { $0 != .sweep || config.backend.supportsSweep }) {
                     Text($0.title).tag($0)
                 }
             }
@@ -401,6 +422,8 @@ struct BenchmarkView: View {
                 NumberRow(title: "Minibatch (0 = backend)", value: $config.minibatch, range: 0...1024)
             case .bench:
                 NumberRow(title: "Minibatch (0 = backend)", value: $config.minibatch, range: 0...1024)
+            case .sfBench, .sfSpeedtest:
+                EmptyView()
             }
 
             DisclosureGroup("Advanced") {
@@ -428,18 +451,46 @@ struct BenchmarkView: View {
         }
     }
 
+    private var stockfishSection: some View {
+        Section {
+            Picker("Test", selection: $config.sfTest) {
+                ForEach(BenchMode.stockfishCases) {
+                    Text($0 == .sfBench ? "Bench" : "Speedtest").tag($0)
+                }
+            }
+            .pickerStyle(.segmented)
+            ThreadsRow(threads: $config.sfThreads)
+            NumberRow(title: "Hash (MB)", value: $config.sfHash, range: 1...4096)
+            if config.sfTest == .sfBench {
+                NumberRow(title: "Depth", value: $config.sfDepth, range: 1...40)
+            } else {
+                NumberRow(title: "Duration (s)", value: $config.sfSeconds, range: 5...3600)
+            }
+            Text("stockfish " + config.stockfishArguments.joined(separator: " "))
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+        } header: {
+            Text(BuildInfo.stockfishVersion ?? "Stockfish")
+        } footer: {
+            Text(config.sfTest.explanation + " Runs on the CPU only.")
+        }
+    }
+
     private var runSection: some View {
         Section {
             Button {
                 run()
             } label: {
-                Label(isBusy ? "Running…" : config.mode == .sweep ? "Run sweep" : "Run benchmark",
+                Label(isBusy ? "Running…"
+                      : config.engine == .stockfish ? "Run Stockfish \(config.sfTest == .sfBench ? "bench" : "speedtest")"
+                      : config.mode == .sweep ? "Run sweep" : "Run benchmark",
                       systemImage: "play.fill")
                     .font(.headline)
                     .frame(maxWidth: .infinity)
             }
             .disabled(isBusy || !canRun
-                      || (config.mode == .sweep && sweepSizes.isEmpty))
+                      || (config.engine == .lc0 && config.mode == .sweep && sweepSizes.isEmpty))
         } footer: {
             if DeviceInfo.lowPowerMode {
                 Label("Low Power Mode is on, so results will be slower.", systemImage: "exclamationmark.triangle")
@@ -461,6 +512,17 @@ struct BenchmarkView: View {
 
     private func run() {
         guard canRun else { return }
+        if config.engine == .stockfish {
+            let snapshot = config.stockfishRun
+            let args = config.stockfishArguments
+            lastResultID = nil
+            runner.run(args, engine: .stockfish) { outcome in
+                let result = BenchResult(config: snapshot, arguments: args, outcome: outcome)
+                results.add(result)
+                lastResultID = result.id
+            }
+            return
+        }
         let snapshot = config
         let paths = self.paths
         lastResultID = nil

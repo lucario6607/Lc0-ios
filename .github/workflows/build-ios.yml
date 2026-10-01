@@ -46,6 +46,19 @@ jobs:
       - name: Build lc0 for iOS
         run: bash scripts/build_lc0.sh
 
+      - name: Cache Stockfish
+        id: sfcache
+        uses: actions/cache@v4
+        with:
+          path: |
+            app/Vendor/lib/libstockfish.a
+            app/Vendor/stockfish.xcconfig
+          key: stockfish-ios-sf_19-${{ hashFiles('scripts/build_stockfish.sh') }}
+
+      - name: Build Stockfish for iOS
+        if: steps.sfcache.outputs.cache-hit != 'true'
+        run: bash scripts/build_stockfish.sh
+
       - name: Generate Xcode project
         working-directory: app
         run: xcodegen generate
@@ -83,6 +96,7 @@ jobs:
           for backend in metal blas eigen onnx-coreml coreml; do
             grep -qx -- "$backend" "$RUNNER_TEMP/strings.txt" || missing="$missing $backend"
           done
+          grep -qx -- "speedtest" "$RUNNER_TEMP/strings.txt" || missing="$missing stockfish"
           if [ -n "$missing" ]; then
             echo "::error::backends missing from app binary:$missing"
             exit 1

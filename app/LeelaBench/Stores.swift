@@ -320,6 +320,12 @@ enum BuildInfo {
     static var lc0Version: String {
         Bundle.main.object(forInfoDictionaryKey: "LC0Version") as? String ?? "unknown"
     }
+    /// e.g. "Stockfish 19 (abc1234, nn-....nnue)", or nil if the build has no Stockfish.
+    static var stockfishVersion: String? {
+        guard let v = Bundle.main.object(forInfoDictionaryKey: "LC0Stockfish") as? String,
+              !v.isEmpty, !v.hasPrefix("$(") else { return nil }
+        return v
+    }
     static var hasCoreML: Bool {
         (Bundle.main.object(forInfoDictionaryKey: "LC0CoreML") as? String) == "true"
     }
@@ -352,6 +358,19 @@ enum DeviceInfo {
     }
 
     static var cpuCores: Int { ProcessInfo.processInfo.activeProcessorCount }
+
+    /// Performance cores (perflevel0); falls back to all cores if unknown.
+    static let performanceCores: Int = sysctlInt("hw.perflevel0.physicalcpu") ?? cpuCores
+
+    /// Efficiency cores (perflevel1), 0 if unknown.
+    static let efficiencyCores: Int = sysctlInt("hw.perflevel1.physicalcpu") ?? 0
+
+    private static func sysctlInt(_ name: String) -> Int? {
+        var value: Int32 = 0
+        var size = MemoryLayout<Int32>.size
+        guard sysctlbyname(name, &value, &size, nil, 0) == 0, value > 0 else { return nil }
+        return Int(value)
+    }
 
     static var thermalState: String {
         switch ProcessInfo.processInfo.thermalState {

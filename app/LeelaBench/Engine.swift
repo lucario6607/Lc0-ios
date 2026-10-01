@@ -140,7 +140,7 @@ final class EngineRunner: ObservableObject {
     }
 
     /// Runs `lc0 <args...>` and calls `completion` when lc0 returns.
-    func run(_ args: [String], completion: @escaping (RunOutcome) -> Void) {
+    func run(_ args: [String], engine: ChessEngine = .lc0, completion: @escaping (RunOutcome) -> Void) {
         guard !isRunning else { return }
         isRunning = true
         arguments = args
@@ -182,10 +182,20 @@ final class EngineRunner: ObservableObject {
 
         let argv0 = Bundle.main.executablePath ?? "lc0"
         let thread = Thread {
-            var cArgs: [UnsafePointer<CChar>?] = ([argv0] + args).map { UnsafePointer(strdup($0)) }
+            var cArgs: [UnsafeMutablePointer<CChar>?] = ([argv0] + args).map { strdup($0) }
             cArgs.append(nil)
-            let code = lc0_main(Int32(cArgs.count - 1), &cArgs)
-            for arg in cArgs { free(UnsafeMutableRawPointer(mutating: arg)) }
+            let argc = Int32(cArgs.count - 1)
+            let code: Int32
+            switch engine {
+            case .lc0:
+                code = cArgs.withUnsafeMutableBufferPointer { buffer in
+                    buffer.baseAddress!.withMemoryRebound(to: UnsafePointer<CChar>?.self,
+                                                          capacity: buffer.count) { lc0_main(argc, $0) }
+                }
+            case .stockfish:
+                code = stockfish_main_c(argc, &cArgs)
+            }
+            for arg in cArgs { free(arg) }
             fflush(stderr)
             fputs("\n\(EngineRunner.exitMarker)\(code)\n", stdout)
             fflush(stdout)

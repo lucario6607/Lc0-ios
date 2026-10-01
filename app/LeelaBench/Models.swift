@@ -2,9 +2,22 @@ import Foundation
 
 // MARK: - Benchmark configuration
 
+/// Which engine a run uses.
+enum ChessEngine: String, CaseIterable, Codable, Identifiable {
+    case lc0, stockfish
+    var id: String { rawValue }
+    var title: String { self == .lc0 ? "lc0" : "Stockfish" }
+}
+
 enum BenchMode: String, CaseIterable, Codable, Identifiable {
     case backendbench, sweep, benchmark, bench
+    case sfBench = "sf-bench", sfSpeedtest = "sf-speedtest"
     var id: String { rawValue }
+
+    static let lc0Cases: [BenchMode] = [.backendbench, .sweep, .benchmark, .bench]
+    static let stockfishCases: [BenchMode] = [.sfBench, .sfSpeedtest]
+
+    var isStockfish: Bool { self == .sfBench || self == .sfSpeedtest }
 
     var title: String {
         switch self {
@@ -12,6 +25,8 @@ enum BenchMode: String, CaseIterable, Codable, Identifiable {
         case .sweep: return "Sweep"
         case .benchmark: return "Search"
         case .bench: return "Quick"
+        case .sfBench: return "SF bench"
+        case .sfSpeedtest: return "SF speedtest"
         }
     }
 
@@ -21,10 +36,12 @@ enum BenchMode: String, CaseIterable, Codable, Identifiable {
         case .sweep: return "Finds the best session batch size: for each size, compiles the model as one session of exactly that size and measures full batches only. Each size is a separate compile, so big nets take a while."
         case .benchmark: return "Full search over test positions (lc0 benchmark)."
         case .bench: return "Short search: 10 positions × 500 ms (lc0 bench)."
+        case .sfBench: return "Stockfish bench: searches its standard test positions to a fixed depth. Same work every run, so nodes/second compares cleanly."
+        case .sfSpeedtest: return "Stockfish speedtest: plays through game positions for a fixed time with the given threads and hash, like a real game."
         }
     }
 
-    var isSearch: Bool { self == .benchmark || self == .bench }
+    var isSearch: Bool { self == .benchmark || self == .bench || isStockfish }
 }
 
 enum Backend: String, CaseIterable, Codable, Identifiable {
@@ -194,6 +211,29 @@ struct BenchConfig: Codable, Equatable {
 
     var extraArgs = ""
 
+    // Stockfish
+    var engine = ChessEngine.lc0
+    var sfTest = BenchMode.sfBench
+    var sfThreads = 2
+    var sfHash = 64
+    var sfDepth = 13
+    var sfSeconds = 60
+
+    /// Stockfish runs one UCI command line: bench or speedtest.
+    var stockfishArguments: [String] {
+        sfTest == .sfSpeedtest
+            ? ["speedtest", "\(sfThreads)", "\(sfHash)", "\(sfSeconds)"]
+            : ["bench", "\(sfHash)", "\(sfThreads)", "\(sfDepth)", "default", "depth"]
+    }
+
+    /// The config as recorded for a Stockfish run.
+    var stockfishRun: BenchConfig {
+        var c = self
+        c.mode = sfTest
+        c.threads = sfThreads
+        return c
+    }
+
     var parsedSweepSizes: [Int] {
         let sizes = sweepSizes.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
         return Array(Set(sizes.filter { (1...1024).contains($0) })).sorted()
@@ -228,6 +268,7 @@ struct BenchConfig: Codable, Equatable {
 
     /// The net and/or Core ML model this run uses, by file name.
     var selectedName: String {
+        if mode.isStockfish { return BuildInfo.stockfishVersion ?? "Stockfish" }
         switch (needsModel, needsNet) {
         case (true, true): return "\(coremlModel) + \(network)"
         case (true, false): return coremlModel
@@ -281,6 +322,9 @@ struct BenchConfig: Codable, Equatable {
     }
 
     var backendLabel: String {
+        if mode.isStockfish {
+            return "stockfish \(threads)t \(sfHash)MB" + (mode == .sfBench ? " d\(sfDepth)" : " \(sfSeconds)s")
+        }
         let sessions = mode == .sweep ? " sweep" : onnxSessions > 0 ? " ×\(onnxSessions)" : ""
         switch backend {
         case .onnxCoreML: return "coreml-\(coreMLUnits.shortTitle) \(effectivePrecision)\(sessions)"
@@ -331,7 +375,7 @@ struct BenchConfig: Codable, Equatable {
         case .benchmark:
             args += ["--num-positions=\(numPositions)", "--movetime=\(movetimeMs)"]
             if nodes > 0 { args.append("--nodes=\(nodes)") }
-        case .bench:
+        case .bench, .sfBench, .sfSpeedtest:
             break
         }
         // Only the search tests have this flag; backendbench rejects it.
@@ -360,6 +404,12 @@ struct BenchConfig: Codable, Equatable {
         coremlModel = value(.coremlModel, d.coremlModel)
         coremlBatch = value(.coremlBatch, d.coremlBatch)
         muxDevices = value(.muxDevices, d.muxDevices)
+        engine = value(.engine, d.engine)
+        sfTest = value(.sfTest, d.sfTest)
+        sfThreads = value(.sfThreads, d.sfThreads)
+        sfHash = value(.sfHash, d.sfHash)
+        sfDepth = value(.sfDepth, d.sfDepth)
+        sfSeconds = value(.sfSeconds, d.sfSeconds)
         mode = value(.mode, d.mode)
         threads = value(.threads, d.threads)
         batches = value(.batches, d.batches)

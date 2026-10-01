@@ -19,6 +19,36 @@ struct NumberRow: View {
     }
 }
 
+/// Thread count with one-tap presets for this device's cores. iOS can't pin
+/// threads to cores; with as many threads as performance cores, the scheduler
+/// normally keeps them there.
+struct ThreadsRow: View {
+    @Binding var threads: Int
+
+    private var presets: [(String, Int)] {
+        var list = [("1", 1)]
+        if DeviceInfo.efficiencyCores > 0 {
+            list.append(("P-cores (\(DeviceInfo.performanceCores))", DeviceInfo.performanceCores))
+        }
+        list.append(("All (\(DeviceInfo.cpuCores))", DeviceInfo.cpuCores))
+        return list
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Stepper("Threads: \(threads)", value: $threads, in: 1...32)
+            HStack {
+                ForEach(presets, id: \.1) { title, value in
+                    Button(title) { threads = value }
+                        .buttonStyle(.bordered)
+                        .tint(threads == value ? .accentColor : .secondary)
+                        .font(.caption)
+                }
+            }
+        }
+    }
+}
+
 /// A big number with a caption, for result summaries.
 struct StatTile: View {
     let title: String
@@ -84,7 +114,9 @@ struct DeviceInfoView: View {
                     LabeledContent("Model", value: DeviceInfo.modelIdentifier)
                     LabeledContent("OS", value: DeviceInfo.osVersion)
                     LabeledContent("GPU", value: DeviceInfo.gpuName)
-                    LabeledContent("CPU cores", value: "\(DeviceInfo.cpuCores)")
+                    LabeledContent("CPU cores", value: DeviceInfo.efficiencyCores > 0
+                        ? "\(DeviceInfo.cpuCores) (\(DeviceInfo.performanceCores) performance + \(DeviceInfo.efficiencyCores) efficiency)"
+                        : "\(DeviceInfo.cpuCores)")
                     LabeledContent("RAM", value: DeviceInfo.physicalMemory)
                     LabeledContent("Available to app", value: DeviceInfo.availableMemory)
                 }
